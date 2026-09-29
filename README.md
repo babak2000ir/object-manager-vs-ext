@@ -16,6 +16,8 @@ For example if there is an image subfolder under your extension project workspac
 
 This extension requires the [AL Language extension for Microsoft Dynamics 365 Business Central](https://marketplace.visualstudio.com/items?itemName=ms-dynamics-smb.al). It is enabled only in workspaces containing an `app.json` with a valid GUID `id`.
 
+Run **Install Object Validation Git Hooks** to enable fresh object checks before commits and pushes for open Git repositories. Node.js must be available on `PATH`. The hooks block on conflicting or out-of-range objects, and also fail closed if the extension is not running or GitHub validation is unavailable. Existing Git hooks and custom `core.hooksPath` configurations are left unchanged. Run **Remove Object Validation Git Hooks** to uninstall the hooks.
+
 ## Extension Settings
 
 Include if your extension adds any VS Code settings through the `contributes.configuration` extension point.

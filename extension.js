@@ -1,7 +1,13 @@
 // The module 'vscode' contains the VS Code extensibility API
 // Import the module and reference it with the alias vscode in your code below
 const vscode = require('vscode');
+const crypto = require('crypto');
 const EXTENSION_CONFIG = require('./config.json');
+const fs = require('fs/promises');
+const http = require('http');
+const path = require('path');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
 const {
 	parseAlObjects,
 	isObjectIdInRanges,
@@ -28,6 +34,9 @@ const INITIAL_RANGE_DATA = EXTENSION_CONFIG.rangeRepository.initialData;
 const REPOSITORY_OWNER_SETTING = EXTENSION_CONFIG.settings.repositoryOwner;
 const REPOSITORY_ACCOUNT_SETTING = EXTENSION_CONFIG.settings.repositoryAccountId;
 const APP_ID_PATTERN = new RegExp(EXTENSION_CONFIG.workspace.appIdPattern, 'i');
+const execFileAsync = promisify(execFile);
+const GIT_HOOKS = ['pre-commit', 'pre-push'];
+const GIT_HOOK_MARKER = 'object-manager-validation-hook';
 let disposeActiveFeatures = () => {};
 
 /** @typedef {{ login: string }} GitHubUser */
@@ -41,6 +50,9 @@ let disposeActiveFeatures = () => {};
 /** @typedef {'outOfRange' | 'conflict' | 'synced' | 'unsynced' | 'checking' | 'unavailable'} ObjectSyncStatus */
 /** @typedef {ExtensionObject & { syncStatus: ObjectSyncStatus }} ExtensionUsageEntry */
 /** @typedef {Record<string, string>} GitHubApiHeaders */
+/** @typedef {{ rootUri: vscode.Uri, onDidCommit: (listener: () => void) => vscode.Disposable }} GitRepository */
+/** @typedef {{ repositories: GitRepository[], onDidOpenRepository: (listener: (repository: GitRepository) => void) => vscode.Disposable }} GitApi */
+/** @typedef {{ url: string, token: string, dispose: () => void }} GitValidationServer */
 /** @typedef {{ label: string, description?: string, isSelected?: boolean, syncStatus?: ObjectSyncStatus, contextValue?: string, object?: ExtensionUsageEntry, command?: string, children?: DebugTreeItem[] }} DebugTreeItem */
 
 // This method is called when your extension is activated
@@ -188,6 +200,63 @@ function startFeatures(featureDisposables) {
 		() => void refreshRepositoryState(),
 		getRepositoryCheckIntervalMs()
 	);
+	const validationServerReady = startValidationServer(() => validateWorkspaceObjects(extensionUsageProvider));
+	void validationServerReady
+		.then(async (server) => {
+			const gitApi = await getGitApi();
+			const observedRepositories = new Set();
+			let postCommitSync = Promise.resolve();
+			/** @param {GitRepository} repository */
+			const observeRepositoryCommits = (repository) => {
+				const repositoryPath = repository.rootUri.fsPath;
+				if (observedRepositories.has(repositoryPath)) {
+					return;
+				}
+				observedRepositories.add(repositoryPath);
+				featureDisposables.push(repository.onDidCommit(() => {
+					postCommitSync = postCommitSync
+						.then(async () => { await syncUnsyncedWorkspaceObjects(extensionUsageProvider); })
+						.catch((error) => {
+							const message = error instanceof Error ? error.message : String(error);
+							vscode.window.showErrorMessage(`Commit succeeded, but object reservations could not be synced: ${message}`);
+						});
+				}));
+			};
+			/** @param {GitRepository} repository */
+			const installForRepository = async (repository) => {
+				observeRepositoryCommits(repository);
+				const installation = await prepareGitHookInstallation(repository);
+				await installGitValidationHooksForRepository(installation, server);
+			};
+			featureDisposables.push(gitApi.onDidOpenRepository((repository) => {
+				void installForRepository(repository).catch((error) => {
+					const message = error instanceof Error ? error.message : String(error);
+					vscode.window.showErrorMessage(`Unable to enable object validation for ${repository.rootUri.fsPath}: ${message}`);
+				});
+			}));
+			await Promise.all(gitApi.repositories.map((repository) => installForRepository(repository)));
+		})
+		.catch((error) => {
+			const message = error instanceof Error ? error.message : String(error);
+			console.error('Unable to install Git validation hooks:', error);
+			vscode.window.showErrorMessage(`Unable to enable automatic object validation for Git operations: ${message}`);
+		});
+	/** @type {GitValidationServer | undefined} */
+	let validationServer;
+	let validationServerDisposed = false;
+	void validationServerReady.then((server) => {
+		if (validationServerDisposed) {
+			server.dispose();
+		} else {
+			validationServer = server;
+		}
+	});
+	const validationServerDisposable = {
+		dispose() {
+			validationServerDisposed = true;
+			validationServer?.dispose();
+		}
+	};
 
 	// The command has been defined in the package.json file
 	// Now provide the implementation of the command with  registerCommand
@@ -266,6 +335,43 @@ function startFeatures(featureDisposables) {
 		'object-manager.syncObjectReservationBusy',
 		() => undefined
 	);
+	const installGitValidationHooks = vscode.commands.registerCommand(
+		'object-manager.installGitValidationHooks',
+		async () => {
+			try {
+			await execFileAsync(process.platform === 'win32' ? 'node.exe' : 'node', ['--version']);
+				const server = await validationServerReady;
+				const repositories = /** @type {GitRepository[]} */ (await getGitRepositories());
+				if (repositories.length === 0) {
+					vscode.window.showInformationMessage('Open a Git repository to install object validation hooks.');
+					return;
+				}
+				const installations = await Promise.all(repositories.map((repository) => prepareGitHookInstallation(repository)));
+				for (const installation of installations) {
+					await installGitValidationHooksForRepository(installation, server);
+				}
+				vscode.window.showInformationMessage('Object validation hooks installed for open Git repositories.');
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				vscode.window.showErrorMessage(`Unable to install object validation hooks: ${message}`);
+			}
+		}
+	);
+	const removeGitValidationHooks = vscode.commands.registerCommand(
+		'object-manager.removeGitValidationHooks',
+		async () => {
+			try {
+				const repositories = /** @type {GitRepository[]} */ (await getGitRepositories());
+				for (const repository of repositories) {
+					await removeGitValidationHooksForRepository(repository);
+				}
+				vscode.window.showInformationMessage('Object validation hooks removed from open Git repositories.');
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				vscode.window.showErrorMessage(`Unable to remove object validation hooks: ${message}`);
+			}
+		}
+	);
 
 	featureDisposables.push(
 		disposable,
@@ -273,6 +379,9 @@ function startFeatures(featureDisposables) {
 		createUpdateApplicationRange,
 		syncObjectReservation,
 		syncObjectReservationBusy,
+		installGitValidationHooks,
+		removeGitValidationHooks,
+		validationServerDisposable,
 		rangeDiagnostics,
 		alFileWatcher,
 		alFileChangeListener,
@@ -295,8 +404,253 @@ function startFeatures(featureDisposables) {
 	);
 }
 
+/** @param {() => Promise<{ ok: boolean, message?: string }>} validate */
+function startValidationServer(validate) {
+	const token = crypto.randomBytes(32).toString('hex');
+	const server = http.createServer(async (request, response) => {
+		if (request.method !== 'POST' || request.url !== '/validate') {
+			response.writeHead(404).end();
+			return;
+		}
+		if (request.headers.authorization !== `Bearer ${token}`) {
+			response.writeHead(403).end();
+			return;
+		}
+		try {
+			const result = await validate();
+			response.writeHead(result.ok ? 200 : 409, { 'Content-Type': 'application/json' });
+			response.end(JSON.stringify(result));
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			response.writeHead(503, { 'Content-Type': 'application/json' });
+			response.end(JSON.stringify({ ok: false, message }));
+		}
+	});
+	return new Promise((resolve, reject) => {
+		server.once('error', reject);
+		server.listen(0, '127.0.0.1', () => {
+			const address = server.address();
+			if (!address || typeof address === 'string') {
+				server.close();
+				reject(new Error('Unable to start the local object validation server.'));
+				return;
+			}
+			resolve({
+				url: `http://127.0.0.1:${address.port}/validate`,
+				token,
+				dispose: () => server.close()
+			});
+		});
+	});
+}
+
+/** @param {ExtensionUsageDataProvider} extensionUsageProvider */
+async function validateWorkspaceObjects(extensionUsageProvider) {
+	const appManifest = await getAlApplicationManifest();
+	if (!appManifest || !Array.isArray(appManifest.manifest.idRanges)) {
+		throw new Error(`Unable to check objects because ${EXTENSION_CONFIG.workspace.appManifestFileName} has no valid idRanges.`);
+	}
+	const objects = await collectExtensionObjects(true);
+	extensionUsageProvider.setObjects(objects, appManifest.manifest.idRanges);
+	if (objects.length === 0) {
+		return { ok: true };
+	}
+	const session = await vscode.authentication.getSession(GITHUB_AUTH_PROVIDER, GITHUB_AUTH_SCOPES, { silent: true });
+	if (!session) {
+		extensionUsageProvider.setSyncUnavailable('Sign in to GitHub to validate object reservations before committing or pushing.');
+		throw new Error('Sign in to GitHub to validate object reservations before committing or pushing.');
+	}
+	const configuration = vscode.workspace.getConfiguration('object-manager');
+	const owner = configuration.get(REPOSITORY_OWNER_SETTING);
+	const accountId = configuration.get(REPOSITORY_ACCOUNT_SETTING);
+	if (typeof owner !== 'string' || !owner || accountId !== session.account.id) {
+		extensionUsageProvider.setSyncUnavailable('Choose the GitHub repository owner before validating object reservations.');
+		throw new Error('Choose the GitHub repository owner for object validation before committing or pushing.');
+	}
+	const repositoryUrl = `${GITHUB_API_URL}/repos/${encodeURIComponent(owner)}/${RANGE_REPOSITORY_NAME}`;
+	let statuses;
+	try {
+		statuses = await getApplicationObjectStatuses(
+			repositoryUrl,
+			objects,
+			appManifest.manifest.idRanges,
+			getGithubHeaders(session)
+		);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		extensionUsageProvider.setSyncUnavailable(message);
+		throw error;
+	}
+	extensionUsageProvider.setSyncStatuses(statuses);
+	const failures = getObjectValidationFailures(statuses);
+	if (failures.length > 0) {
+		const details = failures.map(({ object, status }) =>
+			`${object['object type']} ${object['object name']} (${object['object id']}): ${status === 'conflict' ? 'reservation conflict' : 'ID is out of range'}`
+		).join('; ');
+		vscode.window.showErrorMessage(`Git operation blocked. Refresh object data and resolve: ${details}`);
+		return { ok: false, message: `Resolve object validation errors: ${details}` };
+	}
+	return { ok: true };
+}
+
+/** @param {ExtensionUsageDataProvider} extensionUsageProvider */
+async function syncUnsyncedWorkspaceObjects(extensionUsageProvider) {
+	const appManifest = await getAlApplicationManifest();
+	if (!appManifest || !Array.isArray(appManifest.manifest.idRanges)) {
+		throw new Error(`Unable to sync objects because ${EXTENSION_CONFIG.workspace.appManifestFileName} has no valid idRanges.`);
+	}
+	const objects = await collectExtensionObjects(true);
+	extensionUsageProvider.setObjects(objects, appManifest.manifest.idRanges);
+	if (objects.length === 0) {
+		return 0;
+	}
+	const session = await vscode.authentication.getSession(GITHUB_AUTH_PROVIDER, GITHUB_AUTH_SCOPES, { silent: true });
+	if (!session) {
+		throw new Error('Sign in to GitHub to sync object reservations after committing.');
+	}
+	const configuration = vscode.workspace.getConfiguration('object-manager');
+	const owner = configuration.get(REPOSITORY_OWNER_SETTING);
+	const accountId = configuration.get(REPOSITORY_ACCOUNT_SETTING);
+	if (typeof owner !== 'string' || !owner || accountId !== session.account.id) {
+		throw new Error('Choose the GitHub repository owner to sync object reservations after committing.');
+	}
+	const repositoryUrl = `${GITHUB_API_URL}/repos/${encodeURIComponent(owner)}/${RANGE_REPOSITORY_NAME}`;
+	const headers = getGithubHeaders(session);
+	const statuses = await getApplicationObjectStatuses(
+		repositoryUrl,
+		objects,
+		appManifest.manifest.idRanges,
+		headers
+	);
+	extensionUsageProvider.setSyncStatuses(statuses);
+	const results = await syncUnsyncedApplicationObjects(
+		repositoryUrl,
+		statuses,
+		appManifest.manifest.idRanges,
+		headers,
+		extensionUsageProvider
+	);
+	if (results.synced > 0) {
+		vscode.window.showInformationMessage(`Synced ${results.synced} object reservation${results.synced === 1 ? '' : 's'} after commit.`);
+	}
+	if (results.failed > 0) {
+		vscode.window.showErrorMessage(`Commit succeeded, but ${results.failed} object reservation${results.failed === 1 ? '' : 's'} could not be synced. See the Extension Usage view.`);
+	}
+	return results.synced;
+}
+
+/**
+ * @param {string} repositoryUrl
+ * @param {Array<{ object: ExtensionObject, status: ObjectSyncStatus }>} statuses
+ * @param {unknown} ranges
+ * @param {GitHubApiHeaders} headers
+ * @param {ExtensionUsageDataProvider} extensionUsageProvider
+ */
+async function syncUnsyncedApplicationObjects(repositoryUrl, statuses, ranges, headers, extensionUsageProvider) {
+	const unsyncedObjects = statuses.filter(({ status }) => status === 'unsynced');
+	let synced = 0;
+	let failed = 0;
+	for (const { object } of unsyncedObjects) {
+		extensionUsageProvider.setObjectSyncing(object, true);
+		try {
+			const status = await checkAndUploadApplicationObject(repositoryUrl, object, ranges, headers);
+			extensionUsageProvider.setObjectSyncStatus(object, status);
+			if (status === 'synced') {
+				synced++;
+			} else {
+				failed++;
+			}
+		} catch {
+			extensionUsageProvider.setObjectSyncStatus(object, 'unavailable');
+			failed++;
+		} finally {
+			extensionUsageProvider.setObjectSyncing(object, false);
+		}
+	}
+	return { synced, failed };
+}
+
+/** @returns {Promise<GitApi>} */
+async function getGitApi() {
+	const gitExtension = vscode.extensions.getExtension('vscode.git');
+	if (!gitExtension) {
+		throw new Error('The built-in Git extension is unavailable.');
+	}
+	const exports = await gitExtension.activate();
+	if (typeof exports.getAPI !== 'function') {
+		throw new Error('The built-in Git extension API is unavailable.');
+	}
+	return /** @type {GitApi} */ (exports.getAPI(1));
+}
+
+async function getGitRepositories() {
+	return (await getGitApi()).repositories;
+}
+
+/** @param {{ rootUri: vscode.Uri }} repository */
+async function prepareGitHookInstallation(repository) {
+	const rootPath = repository.rootUri.fsPath;
+	const { stdout: configuredHooksPath } = await execFileAsync('git', ['config', '--get', 'core.hooksPath'], { cwd: rootPath }).catch((error) => {
+		if (error.code === 1) {
+			return { stdout: '' };
+		}
+		throw error;
+	});
+	if (configuredHooksPath.trim()) {
+		throw new Error(`A custom core.hooksPath is configured for ${rootPath}; refusing to change it.`);
+	}
+	const { stdout: hooksPath } = await execFileAsync('git', ['rev-parse', '--git-path', 'hooks'], { cwd: rootPath });
+	const hooksDirectory = path.resolve(rootPath, hooksPath.trim());
+	const validationConfigPath = path.resolve(hooksDirectory, '..', 'object-manager-validation.json');
+	for (const hookName of GIT_HOOKS) {
+		const hookPath = path.join(hooksDirectory, hookName);
+		try {
+			const existingHook = await fs.readFile(hookPath, 'utf8');
+			if (!existingHook.includes(GIT_HOOK_MARKER)) {
+				throw new Error(`A ${hookName} hook already exists for ${rootPath}; it was left unchanged.`);
+			}
+		} catch (error) {
+			if (/** @type {NodeJS.ErrnoException} */ (error).code !== 'ENOENT') {
+				throw error;
+			}
+		}
+	}
+	return { rootPath, hooksDirectory, validationConfigPath };
+}
+
+/** @param {{ rootPath: string, hooksDirectory: string, validationConfigPath: string }} installation @param {{ url: string, token: string }} server */
+async function installGitValidationHooksForRepository(installation, server) {
+	const hookSource = await fs.readFile(path.join(__dirname, 'git-validation-hook.js'));
+	await fs.mkdir(installation.hooksDirectory, { recursive: true });
+	for (const hookName of GIT_HOOKS) {
+		const hookPath = path.join(installation.hooksDirectory, hookName);
+		await fs.writeFile(hookPath, hookSource);
+		await fs.chmod(hookPath, 0o755);
+	}
+	await fs.writeFile(installation.validationConfigPath, JSON.stringify(server));
+}
+
+/** @param {{ rootUri: vscode.Uri }} repository */
+async function removeGitValidationHooksForRepository(repository) {
+	const installation = await prepareGitHookInstallation(repository);
+	for (const hookName of GIT_HOOKS) {
+		const hookPath = path.join(installation.hooksDirectory, hookName);
+		try {
+			const existingHook = await fs.readFile(hookPath, 'utf8');
+			if (existingHook.includes(GIT_HOOK_MARKER)) {
+				await fs.rm(hookPath);
+			}
+		} catch (error) {
+			if (/** @type {NodeJS.ErrnoException} */ (error).code !== 'ENOENT') {
+				throw error;
+			}
+		}
+	}
+	await fs.rm(installation.validationConfigPath, { force: true });
+}
+
 /** @returns {Promise<ExtensionObject[]>} */
-async function collectExtensionObjects() {
+async function collectExtensionObjects(failOnReadError = false) {
 	const files = (await vscode.workspace.findFiles(EXTENSION_CONFIG.workspace.alSourcePattern)).sort((left, right) =>
 		left.toString().localeCompare(right.toString())
 	);
@@ -309,6 +663,9 @@ async function collectExtensionObjects() {
 				objectsById.set(`${object['object type']}:${object['object id']}`, object);
 			}
 		} catch (error) {
+			if (failOnReadError) {
+				throw new Error(`Unable to read AL source file ${file.toString()}: ${error instanceof Error ? error.message : String(error)}`);
+			}
 			console.warn(`Unable to read AL source file ${file.toString()}:`, error);
 		}
 	}
@@ -344,6 +701,11 @@ async function getApplicationObjectStatuses(repositoryUrl, objects, ranges, head
 			status: await getReservationFileStatus(folderContents, object, ranges, headers) || 'unsynced'
 		};
 	}));
+}
+
+/** @param {Array<{ object: ExtensionObject, status: string }>} statuses */
+function getObjectValidationFailures(statuses) {
+	return statuses.filter(({ status }) => status === 'conflict' || status === 'outOfRange');
 }
 
 /** @param {string} repositoryUrl @param {string} objectType @param {GitHubApiHeaders} headers */
@@ -892,5 +1254,10 @@ module.exports = {
 	isObjectIdInRanges,
 	classifyObjectSyncStatus,
 	getApplicationObjectStatuses,
+	getObjectValidationFailures,
+	syncUnsyncedApplicationObjects,
+	startValidationServer,
+	prepareGitHookInstallation,
+	installGitValidationHooksForRepository,
 	checkAndUploadApplicationObject
 }

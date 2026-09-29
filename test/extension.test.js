@@ -2,6 +2,9 @@ const assert = require('assert');
 const fs = require('fs/promises');
 const os = require('os');
 const path = require('path');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
+const execFileAsync = promisify(execFile);
 
 // You can import and use all API from the 'vscode' module
 // as well as import your extension to test it
@@ -15,6 +18,11 @@ const {
 	isObjectIdInRanges,
 	classifyObjectSyncStatus,
 	getApplicationObjectStatuses,
+	getObjectValidationFailures,
+	syncUnsyncedApplicationObjects,
+	startValidationServer,
+	prepareGitHookInstallation,
+	installGitValidationHooksForRepository,
 	checkAndUploadApplicationObject
 } = require('../extension');
 
@@ -157,6 +165,69 @@ query 50105 CustomerQuery {}`;
 		assert.strictEqual(classifyObjectSyncStatus(object, [], reservation), 'outOfRange');
 	});
 
+	test('Blocks validation only for conflicting or out-of-range objects', () => {
+		const object = { 'object type': 'Page', 'object name': 'CustomerCard', 'object id': '50010' };
+		const ranges = [{ from: 50000, to: 50099 }];
+		const statuses = [
+			{ object, status: classifyObjectSyncStatus(object, ranges, { name: 'CustomerCard' }) },
+			{ object, status: classifyObjectSyncStatus(object, ranges, undefined) },
+			{ object, status: classifyObjectSyncStatus(object, ranges, { name: 'DifferentName' }) },
+			{ object, status: classifyObjectSyncStatus(object, [], { name: 'CustomerCard' }) }
+		];
+		assert.deepStrictEqual(
+			getObjectValidationFailures(statuses).map(({ status }) => status),
+			['conflict', 'outOfRange']
+		);
+	});
+
+	test('Requires authorization and blocks Git hooks when validation fails', async () => {
+		const server = await startValidationServer(async () => ({ ok: false, message: 'Resolve the reservation conflict.' }));
+		try {
+			const unauthorizedResponse = await fetch(server.url, { method: 'POST' });
+			assert.strictEqual(unauthorizedResponse.status, 403);
+
+			const validationResponse = await fetch(server.url, {
+				method: 'POST',
+				headers: { Authorization: `Bearer ${server.token}` }
+			});
+			assert.strictEqual(validationResponse.status, 409);
+			assert.deepStrictEqual(await validationResponse.json(), {
+				ok: false,
+				message: 'Resolve the reservation conflict.'
+			});
+		} finally {
+			server.dispose();
+		}
+	});
+
+	test('Installed commit and push hooks block Git when validation fails', async () => {
+		const repositoryPath = await fs.mkdtemp(path.join(os.tmpdir(), 'object-manager-hooks-'));
+		const server = await startValidationServer(async () => ({ ok: false, message: 'Resolve the out-of-range object.' }));
+		try {
+			await execFileAsync('git', ['init', '--quiet'], { cwd: repositoryPath });
+			const installation = await prepareGitHookInstallation({ rootUri: vscode.Uri.file(repositoryPath) });
+			await installGitValidationHooksForRepository(installation, server);
+
+			for (const hookName of ['pre-commit', 'pre-push']) {
+				await assert.rejects(
+					execFileAsync('git', ['hook', 'run', hookName], { cwd: repositoryPath }),
+					(error) => {
+						const gitError = /** @type {NodeJS.ErrnoException & { stderr?: string | Buffer }} */ (error);
+						return String(gitError.code) === '1' && String(gitError.stderr ?? '').includes('Resolve the out-of-range object.');
+					}
+				);
+			}
+			server.dispose();
+			await assert.rejects(
+				execFileAsync('git', ['hook', 'run', 'pre-commit'], { cwd: repositoryPath }),
+				(error) => String(/** @type {NodeJS.ErrnoException} */ (error).code) === '1'
+			);
+		} finally {
+			server.dispose();
+			await fs.rm(repositoryPath, { recursive: true, force: true });
+		}
+	});
+
 	test('Loads reservations from object type folders and treats missing folders as empty', async () => {
 		const originalFetch = global.fetch;
 		const repositoryUrl = `${EXTENSION_CONFIG.github.apiUrl}/repos/example/${EXTENSION_CONFIG.rangeRepository.name}`;
@@ -197,6 +268,49 @@ query 50105 CustomerQuery {}`;
 			assert.ok(requests[0].includes(`/contents/${EXTENSION_CONFIG.rangeRepository.objectReservationsDirectory}/page?ref=${EXTENSION_CONFIG.rangeRepository.branch}`));
 			assert.ok(requests.some((url) => url.includes(`/contents/${EXTENSION_CONFIG.rangeRepository.objectReservationsDirectory}/report?ref=${EXTENSION_CONFIG.rangeRepository.branch}`)));
 			assert.deepStrictEqual(statuses.map(({ status }) => status), ['synced', 'unsynced']);
+		} finally {
+			global.fetch = originalFetch;
+		}
+	});
+
+	test('Uploads every unsynced reservation and leaves synced or out-of-range objects alone', async () => {
+		const originalFetch = global.fetch;
+		const repositoryUrl = `${EXTENSION_CONFIG.github.apiUrl}/repos/example/${EXTENSION_CONFIG.rangeRepository.name}`;
+		const objects = [
+			{ 'object type': 'Table', 'object name': 'Customer', 'object id': '50001' },
+			{ 'object type': 'Page', 'object name': 'CustomerCard', 'object id': '50002' },
+			{ 'object type': 'Report', 'object name': 'SalesReport', 'object id': '50003' },
+			{ 'object type': 'Codeunit', 'object name': 'Handler', 'object id': '50004' }
+		];
+		const ranges = [{ from: 50000, to: 50099 }];
+		const statuses = /** @type {Parameters<typeof syncUnsyncedApplicationObjects>[1]} */ ([]);
+		statuses.push(
+			{ object: objects[0], status: classifyObjectSyncStatus(objects[0], ranges, { name: 'Customer' }) },
+			{ object: objects[1], status: classifyObjectSyncStatus(objects[1], ranges, undefined) },
+			{ object: objects[2], status: classifyObjectSyncStatus(objects[2], ranges, { name: 'SalesReport' }) },
+			{ object: objects[3], status: classifyObjectSyncStatus(objects[3], [], undefined) }
+		);
+		const provider = new (require('../tree-data-providers').ExtensionUsageDataProvider)();
+		provider.setObjects(objects, ranges);
+		provider.setSyncStatuses(statuses);
+		const requests = [];
+		try {
+			global.fetch = async (url, options = {}) => {
+				requests.push({ url: String(url), options });
+				return options.method === 'PUT'
+					? new Response('{}', { status: 201 })
+					: new Response('[]', { status: 200 });
+			};
+
+			const results = await syncUnsyncedApplicationObjects(repositoryUrl, statuses, ranges, {}, provider);
+
+			assert.deepStrictEqual(results, { synced: 1, failed: 0 });
+			assert.strictEqual(requests.length, 2);
+			assert.ok(requests[0].url.endsWith('/object-reservations/page?ref=main'));
+			assert.ok(requests[1].url.endsWith('/object-reservations/page/page50002'));
+			assert.deepStrictEqual(provider.objects.map(({ syncStatus }) => syncStatus), [
+				'synced', 'synced', 'synced', 'outOfRange'
+			]);
 		} finally {
 			global.fetch = originalFetch;
 		}

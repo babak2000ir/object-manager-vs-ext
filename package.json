@@ -15,7 +15,8 @@
     "workspaceContains:**/app.json"
   ],
   "extensionDependencies": [
-    "ms-dynamics-smb.al"
+    "ms-dynamics-smb.al",
+    "vscode.git"
   ],
   "main": "./extension.js",
   "contributes": {
@@ -41,6 +42,14 @@
         "command": "object-manager.syncObjectReservationBusy",
         "title": "Syncing Object Reservation",
         "icon": "$(loading~spin)"
+      },
+      {
+        "command": "object-manager.installGitValidationHooks",
+        "title": "Install Object Validation Git Hooks"
+      },
+      {
+        "command": "object-manager.removeGitValidationHooks",
+        "title": "Remove Object Validation Git Hooks"
       }
     ],
     "menus": {
