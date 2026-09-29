@@ -2,6 +2,9 @@
   "github": {
     "providerId": "github",
     "apiUrl": "https://api.github.com",
+    "acceptHeader": "application/vnd.github+json",
+    "apiVersion": "2022-11-28",
+    "organizationPageSize": 100,
     "scopes": [
       "read:org",
       "repo"
@@ -9,8 +12,10 @@
   },
   "rangeRepository": {
     "name": "bc-object-management",
+    "displayName": "bc-object-manager",
     "fileName": "data.json",
     "branch": "main",
+    "objectReservationsDirectory": "object-reservations",
     "initialData": {
       "Remarks": [
         "Describe the range allocation here."
@@ -33,5 +38,16 @@
         }
       ]
     }
+  },
+  "workspace": {
+    "appManifestFileName": "app.json",
+    "appManifestPattern": "**/app.json",
+    "alSourcePattern": "**/*.al",
+    "alSourceExtension": ".al",
+    "appIdPattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+  },
+  "settings": {
+    "repositoryOwner": "repositoryOwner",
+    "repositoryAccountId": "repositoryAccountId"
   }
 }

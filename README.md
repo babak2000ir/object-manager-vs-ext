@@ -14,7 +14,7 @@ For example if there is an image subfolder under your extension project workspac
 
 ## Requirements
 
-If you have any requirements or dependencies, add a section describing those and how to install and configure them.
+This extension requires the [AL Language extension for Microsoft Dynamics 365 Business Central](https://marketplace.visualstudio.com/items?itemName=ms-dynamics-smb.al). It is enabled only in workspaces containing an `app.json` with a valid GUID `id`.
 
 ## Extension Settings
 

@@ -10,7 +10,12 @@
     "Other"
   ],
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+    "onLanguage:al",
+    "workspaceContains:**/app.json"
+  ],
+  "extensionDependencies": [
+    "ms-dynamics-smb.al"
   ],
   "main": "./extension.js",
   "contributes": {
@@ -22,8 +27,37 @@
       {
         "command": "object-manager.manageAccountPreference",
         "title": "Manage Extension Account Preference"
+      },
+      {
+        "command": "object-manager.createUpdateApplicationRange",
+        "title": "Create/Update Application Range"
+      },
+      {
+        "command": "object-manager.syncObjectReservation",
+        "title": "Sync Object Reservation",
+        "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "object-manager.syncObjectReservationBusy",
+        "title": "Syncing Object Reservation",
+        "icon": "$(loading~spin)"
       }
     ],
+    "menus": {
+      "view/item/context": [
+        {
+          "command": "object-manager.syncObjectReservation",
+          "when": "view == object-manager.extensionUsage && viewItem == unsyncedObject",
+          "group": "inline"
+        },
+        {
+          "command": "object-manager.syncObjectReservationBusy",
+          "when": "view == object-manager.extensionUsage && viewItem == syncingObject",
+          "group": "inline",
+          "enablement": "false"
+        }
+      ]
+    },
     "configuration": {
       "title": "BC Object Manager",
       "properties": {
@@ -31,7 +65,7 @@
           "type": "string",
           "default": "",
           "scope": "resource",
-          "description": "GitHub account or organization that owns the bc-object-manager repository."
+          "description": "GitHub account or organization that owns the Object Manager repository."
         },
         "object-manager.repositoryAccountId": {
           "type": "string",
