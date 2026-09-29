@@ -9,13 +9,67 @@
   "categories": [
     "Other"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./extension.js",
   "contributes": {
-    "commands": [{
-      "command": "object-manager.helloWorld",
-      "title": "Hello World"
-    }]
+    "commands": [
+      {
+        "command": "object-manager.helloWorld",
+        "title": "Hello World"
+      },
+      {
+        "command": "object-manager.manageAccountPreference",
+        "title": "Manage Extension Account Preference"
+      }
+    ],
+    "configuration": {
+      "title": "BC Object Manager",
+      "properties": {
+        "object-manager.repositoryOwner": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "description": "GitHub account or organization that owns the bc-object-manager repository."
+        },
+        "object-manager.repositoryAccountId": {
+          "type": "string",
+          "default": "",
+          "scope": "resource",
+          "description": "GitHub account associated with the selected repository owner."
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "object-manager",
+          "title": "Object Manager",
+          "icon": "media/object-manager.svg"
+        }
+      ]
+    },
+    "views": {
+      "object-manager": [
+        {
+          "id": "object-manager.commands",
+          "name": "Commands"
+        },
+        {
+          "id": "object-manager.extensionUsage",
+          "name": "Extension Usage"
+        },
+        {
+          "id": "object-manager.organizationUsage",
+          "name": "Organization Usage"
+        },
+        {
+          "id": "object-manager.debug",
+          "name": "Debug"
+        }
+      ]
+    }
   },
   "scripts": {
     "lint": "eslint .",

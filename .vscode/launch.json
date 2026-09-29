@@ -11,7 +11,16 @@
 			"request": "launch",
 			"args": [
 				"--extensionDevelopmentPath=${workspaceFolder}"
-			]
+			],
+			"trace": true
+		},
+		{
+			"name": "Attach to Extension Host",
+			"type": "node",
+			"request": "attach",
+			"address": "127.0.0.1",
+			"port": 9229,
+			"timeout": 30000
 		}
 	]
 }

@@ -1,0 +1,32 @@
+{
+  "github": {
+    "providerId": "github",
+    "apiUrl": "https://api.github.com",
+    "scopes": [
+      "read:org",
+      "repo"
+    ]
+  },
+  "rangeRepository": {
+    "name": "bc-object-management",
+    "fileName": "range.json",
+    "branch": "main",
+    "initialData": [
+      {
+        "id": "00000000-0000-0000-0000-000000000000",
+        "name": "Extension Name",
+        "publisher": "Publisher",
+        "ranges": [
+          {
+            "from": 50000,
+            "to": 50100
+          },
+          {
+            "from": 50100,
+            "to": 50200
+          }
+        ]
+      }
+    ]
+  }
+}

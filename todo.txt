@@ -1,0 +1,3 @@
+make a nice menaingful README.MD and a version inside it and nice mechnaism for object manager extension to update it.
+create a timer like mechanism to fetch the repo every 5 minutes silently (preferably not when vs code is busy)
+json inits and timestamp mechanism
