@@ -19,6 +19,7 @@ const REPOSITORY_ACCOUNT_SETTING = 'repositoryAccountId';
 /** @typedef {{ content: string }} GitHubContentsFile */
 /** @typedef {{ object: { sha: string } }} GitHubReference */
 /** @typedef {{ id: string, name: string, publisher: string, ranges: Array<{ from: number, to: number }> }} RangeRegistration */
+/** @typedef {{ Remarks: string[], ranges: RangeRegistration[] }} RangeData */
 /** @typedef {Record<string, string>} GitHubApiHeaders */
 /** @typedef {{ label: string, description?: string, isSelected?: boolean, command?: string, children?: DebugTreeItem[] }} DebugTreeItem */
 
@@ -130,6 +131,7 @@ async function configureGithubRepositoryOwner(showAccountPicker = false, debugPr
 		return;
 	}
 	organizationUsageProvider?.setStatus(`Checking ${RANGE_REPOSITORY_NAME}/${RANGE_FILE_NAME}...`);
+	debugProvider?.setRemarks([]);
 
 	try {
 		const session = await selectGithubAccount(showAccountPicker);
@@ -151,12 +153,12 @@ async function configureGithubRepositoryOwner(showAccountPicker = false, debugPr
 
 		if (organizations.length === 0) {
 			await saveRepositoryOwner(accountLogin, session.account.id);
-			await ensureRangeRepository(accountLogin, accountLogin, headers, organizationUsageProvider);
+			await ensureRangeRepository(accountLogin, accountLogin, headers, organizationUsageProvider, debugProvider);
 			return;
 		}
 
 		if (!showAccountPicker && !accountChanged && typeof configuredOwner === 'string' && validOwners.includes(configuredOwner)) {
-			await ensureRangeRepository(configuredOwner, accountLogin, headers, organizationUsageProvider);
+			await ensureRangeRepository(configuredOwner, accountLogin, headers, organizationUsageProvider, debugProvider);
 			return;
 		}
 
@@ -178,7 +180,7 @@ async function configureGithubRepositoryOwner(showAccountPicker = false, debugPr
 
 		if (selection) {
 			await saveRepositoryOwner(selection.owner, session.account.id);
-			await ensureRangeRepository(selection.owner, accountLogin, headers, organizationUsageProvider);
+			await ensureRangeRepository(selection.owner, accountLogin, headers, organizationUsageProvider, debugProvider);
 		} else {
 			organizationUsageProvider?.setStatus(`Select an account or organization to load ${RANGE_FILE_NAME}.`);
 		}
@@ -211,8 +213,9 @@ async function getGithubOrganizations(headers) {
  * @param {string} accountLogin
  * @param {GitHubApiHeaders} headers
  * @param {OrganizationUsageDataProvider} [organizationUsageProvider]
+ * @param {GithubDebugDataProvider} [debugProvider]
  */
-async function ensureRangeRepository(owner, accountLogin, headers, organizationUsageProvider) {
+async function ensureRangeRepository(owner, accountLogin, headers, organizationUsageProvider, debugProvider) {
 	const repositoryPath = `/repos/${encodeURIComponent(owner)}/${RANGE_REPOSITORY_NAME}`;
 	const repositoryUrl = `${GITHUB_API_URL}${repositoryPath}`;
 	const repositoryResponse = await fetch(repositoryUrl, { headers });
@@ -253,14 +256,20 @@ async function ensureRangeRepository(owner, accountLogin, headers, organizationU
 			}
 			const file = /** @type {GitHubContentsFile} */ (await contentsResponse.json());
 			const fileContent = Buffer.from(file.content.replace(/\s/g, ''), 'base64').toString('utf8');
-			rangeData = JSON.parse(fileContent);
-			if (!Array.isArray(rangeData)) {
-				throw new Error(`${RANGE_FILE_NAME} must contain a JSON array.`);
+			const parsedRangeData = /** @type {RangeData} */ (JSON.parse(fileContent));
+			if (
+				!parsedRangeData ||
+				!Array.isArray(parsedRangeData.Remarks) ||
+				!Array.isArray(parsedRangeData.ranges)
+			) {
+				throw new Error(`${RANGE_FILE_NAME} must contain Remarks and ranges arrays.`);
 			}
+			rangeData = parsedRangeData;
 		}
 	}
 
 	organizationUsageProvider?.setRangeData(owner, rangeData);
+	debugProvider?.setRemarks(rangeData.Remarks);
 }
 
 /**
@@ -391,13 +400,13 @@ class OrganizationUsageDataProvider extends TreeDataProvider {
 
 	/**
 	 * @param {string} owner
-	 * @param {RangeRegistration[]} registrations
+	 * @param {RangeData} rangeData
 	 */
-	setRangeData(owner, registrations) {
+	setRangeData(owner, rangeData) {
 		this.items = [{
 			label: RANGE_FILE_NAME,
 			description: `${owner}/${RANGE_REPOSITORY_NAME} (${RANGE_BRANCH})`,
-			children: registrations.map((registration) => ({
+			children: rangeData.ranges.map((registration) => ({
 				label: `${registration.name} (${registration.publisher})`,
 				description: registration.id,
 				children: registration.ranges.map((range) => ({
@@ -421,6 +430,17 @@ class OrganizationUsageDataProvider extends TreeDataProvider {
 }
 
 class GithubDebugDataProvider extends TreeDataProvider {
+	constructor() {
+		super();
+		/** @type {string[]} */
+		this.remarks = [];
+	}
+
+	/** @param {string[]} remarks */
+	setRemarks(remarks) {
+		this.remarks = remarks;
+		this.refresh();
+	}
 
 	/**
 	 * @param {DebugTreeItem} [element]
@@ -455,7 +475,13 @@ class GithubDebugDataProvider extends TreeDataProvider {
 
 			return [
 				{ label: 'GitHub accounts', children: accountItems },
-				{ label: 'Repository owner', children: repositoryOwnerItems }
+				{ label: 'Repository owner', children: repositoryOwnerItems },
+				{
+					label: 'Remarks',
+					children: this.remarks.length > 0
+						? this.remarks.map((remark) => ({ label: remark }))
+						: [{ label: `No remarks in ${RANGE_FILE_NAME}.` }]
+				}
 			];
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);

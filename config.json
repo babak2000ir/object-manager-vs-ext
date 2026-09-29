@@ -9,24 +9,29 @@
   },
   "rangeRepository": {
     "name": "bc-object-management",
-    "fileName": "range.json",
+    "fileName": "data.json",
     "branch": "main",
-    "initialData": [
-      {
-        "id": "00000000-0000-0000-0000-000000000000",
-        "name": "Extension Name",
-        "publisher": "Publisher",
-        "ranges": [
-          {
-            "from": 50000,
-            "to": 50100
-          },
-          {
-            "from": 50100,
-            "to": 50200
-          }
-        ]
-      }
-    ]
+    "initialData": {
+      "Remarks": [
+        "Describe the range allocation here."
+      ],
+      "ranges": [
+        {
+          "id": "00000000-0000-0000-0000-000000000000",
+          "name": "Extension Name",
+          "publisher": "Publisher",
+          "ranges": [
+            {
+              "from": 50000,
+              "to": 50100
+            },
+            {
+              "from": 50100,
+              "to": 50200
+            }
+          ]
+        }
+      ]
+    }
   }
 }
