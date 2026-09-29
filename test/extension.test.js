@@ -7,6 +7,7 @@ const path = require('path');
 // as well as import your extension to test it
 const vscode = require('vscode');
 const EXTENSION_CONFIG = require('../config.json');
+const { activateOnTriggers } = require('../feature-lifecycle');
 const {
 	hasAlWorkspace,
 	createApplicationRegistration,
@@ -23,6 +24,36 @@ suite('Extension Test Suite', () => {
 	test('Sample test', () => {
 		assert.strictEqual(-1, [1, 2, 3].indexOf(5));
 		assert.strictEqual(-1, [1, 2, 3].indexOf(0));
+	});
+
+	test('Activates and disposes features from lifecycle triggers', async () => {
+		let enabled = false;
+		let startCount = 0;
+		let stopCount = 0;
+		let triggerDisposed = false;
+		/** @type {Array<() => void>} */
+		const listeners = [];
+		const lifecycle = activateOnTriggers([
+			(listener) => {
+				listeners.push(listener);
+				return { dispose: () => { triggerDisposed = true; } };
+			}
+		], async () => enabled, () => startCount++, () => stopCount++);
+		const flushLifecycleCheck = () => new Promise((resolve) => setImmediate(resolve));
+
+		await flushLifecycleCheck();
+		assert.strictEqual(startCount, 0);
+		enabled = true;
+		listeners[0]();
+		await flushLifecycleCheck();
+		assert.strictEqual(startCount, 1);
+		enabled = false;
+		listeners[0]();
+		await flushLifecycleCheck();
+		assert.strictEqual(stopCount, 1);
+
+		lifecycle.dispose();
+		assert.strictEqual(triggerDisposed, true);
 	});
 
 	test('Only accepts AL app manifests with a GUID id', async () => {

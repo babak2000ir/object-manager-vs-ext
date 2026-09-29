@@ -2,6 +2,19 @@
 // Import the module and reference it with the alias vscode in your code below
 const vscode = require('vscode');
 const EXTENSION_CONFIG = require('./config.json');
+const {
+	parseAlObjects,
+	isObjectIdInRanges,
+	normalizeObjectFilename,
+	classifyObjectSyncStatus
+} = require('./object-model');
+const { activateOnTriggers } = require('./feature-lifecycle');
+const {
+	TreeDataProvider,
+	ExtensionUsageDataProvider,
+	OrganizationUsageDataProvider,
+	GithubDebugDataProvider
+} = require('./tree-data-providers');
 
 const GITHUB_AUTH_PROVIDER = EXTENSION_CONFIG.github.providerId;
 const GITHUB_AUTH_SCOPES = EXTENSION_CONFIG.github.scopes;
@@ -39,50 +52,55 @@ let disposeActiveFeatures = () => {};
 function activate(context) {
 	/** @type {vscode.Disposable[]} */
 	const featureDisposables = [];
-	let featuresActive = false;
-	let workspaceCheckId = 0;
-	const updateWorkspaceState = async () => {
-		const checkId = ++workspaceCheckId;
-		const shouldActivate = await hasAlWorkspace();
-		if (checkId !== workspaceCheckId || shouldActivate === featuresActive) {
-			return;
+	/** @type {Array<(listener: () => void) => vscode.Disposable>} */
+	const workspaceTriggers = [
+		(listener) => vscode.workspace.onDidChangeWorkspaceFolders(listener),
+		(listener) => {
+			const watcher = vscode.workspace.createFileSystemWatcher(EXTENSION_CONFIG.workspace.appManifestPattern);
+			const subscriptions = [
+				watcher.onDidChange(listener),
+				watcher.onDidCreate(listener),
+				watcher.onDidDelete(listener)
+			];
+			return {
+				dispose() {
+					watcher.dispose();
+					for (const subscription of subscriptions) {
+						subscription.dispose();
+					}
+				}
+			};
 		}
-		if (shouldActivate) {
-			featuresActive = true;
-			startFeatures(featureDisposables);
-		} else {
-			featuresActive = false;
-			for (const disposable of featureDisposables.splice(0)) {
-				disposable.dispose();
-			}
-		}
-	};
-	const appManifestWatcher = vscode.workspace.createFileSystemWatcher(EXTENSION_CONFIG.workspace.appManifestPattern);
-	const workspaceChangeListener = vscode.workspace.onDidChangeWorkspaceFolders(() => void updateWorkspaceState());
-	const appManifestChangeListener = appManifestWatcher.onDidChange(() => void updateWorkspaceState());
-	const appManifestCreateListener = appManifestWatcher.onDidCreate(() => void updateWorkspaceState());
-	const appManifestDeleteListener = appManifestWatcher.onDidDelete(() => void updateWorkspaceState());
-	context.subscriptions.push(
-		appManifestWatcher,
-		workspaceChangeListener,
-		appManifestChangeListener,
-		appManifestCreateListener,
-		appManifestDeleteListener
-	);
-	disposeActiveFeatures = () => {
+	];
+	const stopFeatures = () => {
 		for (const disposable of featureDisposables.splice(0)) {
 			disposable.dispose();
 		}
-		featuresActive = false;
 	};
-	void updateWorkspaceState();
+	const workspaceLifecycle = activateOnTriggers(
+		workspaceTriggers,
+		hasAlWorkspace,
+		() => startFeatures(featureDisposables),
+		stopFeatures
+	);
+	context.subscriptions.push(workspaceLifecycle);
+	disposeActiveFeatures = stopFeatures;
 }
 
 /** @param {vscode.Disposable[]} featureDisposables */
 function startFeatures(featureDisposables) {
 	console.log('Congratulations, your extension "object-manager" is now active!');
-	const debugProvider = new GithubDebugDataProvider();
-	const organizationUsageProvider = new OrganizationUsageDataProvider();
+	const debugProvider = new GithubDebugDataProvider({
+		hasAlWorkspace,
+		getGithubHeaders,
+		getGithubJson,
+		getGithubOrganizations,
+		providerId: GITHUB_AUTH_PROVIDER,
+		scopes: GITHUB_AUTH_SCOPES,
+		repositoryOwnerSetting: REPOSITORY_OWNER_SETTING,
+		repositoryAccountSetting: REPOSITORY_ACCOUNT_SETTING
+	});
+	const organizationUsageProvider = new OrganizationUsageDataProvider(hasAlWorkspace);
 	const extensionUsageProvider = new ExtensionUsageDataProvider();
 	const rangeDiagnostics = vscode.languages.createDiagnosticCollection('object-manager');
 	let extensionObjectRefresh = Promise.resolve();
@@ -277,36 +295,6 @@ function startFeatures(featureDisposables) {
 	);
 }
 
-/** @param {string} source @returns {ExtensionObject[]} */
-function parseAlObjects(source) {
-	const withoutBlockComments = source.replace(/\/\*[\s\S]*?\*\//g, (comment) =>
-		comment.replace(/[^\r\n]/g, ' ')
-	);
-	const objectTypes = /** @type {Record<string, string>} */ ({
-		table: 'Table',
-		report: 'Report',
-		codeunit: 'Codeunit',
-		xmlport: 'XMLport',
-		menusuite: 'MenuSuite',
-		page: 'Page',
-		query: 'Query'
-	});
-	const objectPattern = /^\s*(table|report|codeunit|xmlport|menusuite|page|query)\s+(\d+)\s+("(?:[^"]|"")*"|[A-Za-z_][A-Za-z0-9_]*)/gim;
-	/** @type {ExtensionObject[]} */
-	const objects = [];
-	for (const match of withoutBlockComments.matchAll(objectPattern)) {
-		const rawName = match[3];
-		objects.push({
-			'object type': objectTypes[match[1].toLowerCase()],
-			'object name': rawName.startsWith('"')
-				? rawName.slice(1, -1).replace(/""/g, '"')
-				: rawName,
-			'object id': match[2]
-		});
-	}
-	return objects;
-}
-
 /** @returns {Promise<ExtensionObject[]>} */
 async function collectExtensionObjects() {
 	const files = (await vscode.workspace.findFiles(EXTENSION_CONFIG.workspace.alSourcePattern)).sort((left, right) =>
@@ -328,46 +316,6 @@ async function collectExtensionObjects() {
 		left['object type'].localeCompare(right['object type']) ||
 		Number(left['object id']) - Number(right['object id'])
 	);
-}
-
-/** @param {string} objectId @param {unknown} ranges */
-function isObjectIdInRanges(objectId, ranges) {
-	const numericId = Number(objectId);
-	return Number.isFinite(numericId) && Array.isArray(ranges) && ranges.some((range) =>
-		range && typeof range === 'object' &&
-		typeof range.from === 'number' && typeof range.to === 'number' &&
-		numericId >= range.from && numericId <= range.to
-	);
-}
-
-/** @param {ExtensionObject} object */
-function getExtensionObjectKey(object) {
-	return `${object['object type']}:${object['object id']}`;
-}
-
-/** @param {string} filename */
-function normalizeObjectFilename(filename) {
-	return filename
-		.replace(/\.json$/i, '')
-		.replace(/[^a-z0-9]/gi, '')
-		.toLowerCase();
-}
-
-/** @param {ExtensionObject} object @param {unknown} ranges @param {unknown} remoteRecord @returns {ObjectSyncStatus} */
-function classifyObjectSyncStatus(object, ranges, remoteRecord) {
-	if (!isObjectIdInRanges(object['object id'], ranges)) {
-		return 'outOfRange';
-	}
-	if (remoteRecord === undefined) {
-		return 'unsynced';
-	}
-	const record = /** @type {{ name?: unknown }} */ (remoteRecord);
-	if (!record || typeof record !== 'object' || typeof record.name !== 'string') {
-		return 'conflict';
-	}
-	return record.name === object['object name']
-		? 'synced'
-		: 'conflict';
 }
 
 /**
@@ -926,325 +874,6 @@ function saveRepositoryOwner(owner, accountId) {
 		configuration.update(REPOSITORY_OWNER_SETTING, owner, vscode.ConfigurationTarget.Workspace),
 		configuration.update(REPOSITORY_ACCOUNT_SETTING, accountId, vscode.ConfigurationTarget.Workspace)
 	]);
-}
-
-class TreeDataProvider {
-	/** @param {DebugTreeItem[]} [items] */
-	constructor(items = []) {
-		this.changeEmitter = new vscode.EventEmitter();
-		this.onDidChangeTreeData = this.changeEmitter.event;
-		this.items = items;
-	}
-
-	refresh() {
-		this.changeEmitter.fire(undefined);
-	}
-
-	/**
-	 * @param {DebugTreeItem} item
-	 * @returns {vscode.TreeItem}
-	 */
-	getTreeItem(item) {
-		const treeItem = new vscode.TreeItem(
-			item.label,
-			item.children ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.None
-		);
-		treeItem.description = item.description;
-		if (item.isSelected) {
-			treeItem.iconPath = new vscode.ThemeIcon('check', new vscode.ThemeColor('testing.iconPassed'));
-		}
-		if (item.syncStatus) {
-			const icons = {
-				outOfRange: ['close', 'testing.iconFailed'],
-				conflict: ['warning', 'editorWarning.foreground'],
-				synced: ['check', 'testing.iconPassed'],
-				unsynced: ['cloud-upload', 'charts.blue'],
-				checking: ['sync', 'charts.blue'],
-				unavailable: ['circle-slash', 'editorWarning.foreground']
-			};
-			const [icon, color] = icons[item.syncStatus];
-			treeItem.iconPath = new vscode.ThemeIcon(icon, new vscode.ThemeColor(color));
-		}
-		if (item.command) {
-			treeItem.command = { command: item.command, title: item.label };
-		}
-		treeItem.contextValue = item.contextValue;
-		return treeItem;
-	}
-
-	/**
-	 * @param {DebugTreeItem} [element]
-	 * @returns {Promise<DebugTreeItem[]>}
-	 */
-	async getChildren(element) {
-		return element ? element.children || [] : this.items;
-	}
-}
-
-class ExtensionUsageDataProvider extends TreeDataProvider {
-	constructor() {
-		super([{ label: 'Scanning AL source files...' }]);
-		/** @type {ExtensionUsageEntry[]} */
-		this.objects = [];
-		/** @type {unknown} */
-		this.ranges = undefined;
-		/** @type {Map<string, { status: ObjectSyncStatus, name: string }>} */
-		this.remoteStatuses = new Map();
-		/** @type {Set<string>} */
-		this.syncingObjects = new Set();
-		/** @type {string | undefined} */
-		this.syncError = undefined;
-	}
-
-	/** @param {ExtensionObject[]} objects @param {unknown} ranges */
-	setObjects(objects, ranges) {
-		this.ranges = ranges;
-		this.syncError = undefined;
-		this.objects = objects.map((object) => {
-			const key = getExtensionObjectKey(object);
-			const remoteStatus = this.remoteStatuses.get(key);
-			const status = !isObjectIdInRanges(object['object id'], ranges)
-				? 'outOfRange'
-				: remoteStatus?.name === object['object name']
-					? remoteStatus.status
-					: 'checking';
-			return { ...object, syncStatus: status };
-		});
-		this.renderObjects();
-	}
-
-	/** @returns {ExtensionObject[]} */
-	getObjects() {
-		return this.objects.map((object) => ({
-			'object type': object['object type'],
-			'object name': object['object name'],
-			'object id': object['object id']
-		}));
-	}
-
-	/** @param {ExtensionObject} object @returns {ExtensionUsageEntry | undefined} */
-	getCurrentObject(object) {
-		return this.objects.find((entry) =>
-			getExtensionObjectKey(entry) === getExtensionObjectKey(object) &&
-			entry['object name'] === object['object name']
-		);
-	}
-
-	/** @param {ExtensionObject} object @param {ObjectSyncStatus} status */
-	setObjectSyncStatus(object, status) {
-		const key = getExtensionObjectKey(object);
-		this.remoteStatuses.set(key, { status, name: object['object name'] });
-		this.objects = this.objects.map((entry) =>
-			getExtensionObjectKey(entry) === key && entry['object name'] === object['object name']
-				? { ...entry, syncStatus: status }
-				: entry
-		);
-		this.renderObjects();
-	}
-
-	/** @param {ExtensionObject} object @param {boolean} syncing */
-	setObjectSyncing(object, syncing) {
-		const key = getExtensionObjectKey(object);
-		if (syncing) {
-			this.syncingObjects.add(key);
-		} else {
-			this.syncingObjects.delete(key);
-		}
-		this.renderObjects();
-	}
-
-	/** @param {ExtensionObject} object @returns {boolean} */
-	isObjectSyncing(object) {
-		return this.syncingObjects.has(getExtensionObjectKey(object));
-	}
-
-	/** @param {Array<{ object: ExtensionObject, status: ObjectSyncStatus }>} statuses */
-	setSyncStatuses(statuses) {
-		this.syncError = undefined;
-		this.remoteStatuses = new Map(statuses.map(({ object, status }) => [
-			getExtensionObjectKey(object),
-			{ status, name: object['object name'] }
-		]));
-		this.objects = this.objects.map((entry) => ({
-			...entry,
-			syncStatus: !isObjectIdInRanges(entry['object id'], this.ranges)
-				? 'outOfRange'
-				: this.remoteStatuses.get(getExtensionObjectKey(entry))?.status || 'checking'
-		}));
-		this.renderObjects();
-	}
-
-	/** @param {string} message */
-	setSyncUnavailable(message) {
-		this.syncError = message;
-		this.objects = this.objects.map((entry) => ({
-			...entry,
-			syncStatus: isObjectIdInRanges(entry['object id'], this.ranges) ? 'unavailable' : 'outOfRange'
-		}));
-		this.renderObjects();
-	}
-
-	renderObjects() {
-		const groups = /** @type {{ status: ObjectSyncStatus, label: string }[]} */ ([
-			{ status: 'conflict', label: 'Conflicts' },
-			{ status: 'unsynced', label: 'Unsynced' },
-			{ status: 'outOfRange', label: 'Out of range' },
-			{ status: 'synced', label: 'Synced' },
-			{ status: 'checking', label: 'Checking' },
-			{ status: 'unavailable', label: 'Sync unavailable' }
-		]);
-		this.items = this.objects.length === 0
-			? [{ label: 'No AL objects found.' }]
-			: groups.flatMap(({ status, label }) => {
-				const matches = this.objects.filter((object) => object.syncStatus === status);
-				return matches.length === 0 ? [] : [{
-					label: `${label} (${matches.length})`,
-					description: status === 'unavailable' ? this.syncError : undefined,
-					syncStatus: status,
-					children: matches.map((object) => ({
-						label: `${object['object type']} ${object['object name']}`,
-						description: object['object id'],
-						syncStatus: object.syncStatus,
-							contextValue: object.syncStatus === 'unsynced'
-								? this.isObjectSyncing(object) ? 'syncingObject' : 'unsyncedObject'
-								: undefined,
-						object
-					}))
-				}];
-			});
-		this.refresh();
-	}
-}
-
-class OrganizationUsageDataProvider extends TreeDataProvider {
-	constructor() {
-		super([{ label: 'Waiting for GitHub account selection.' }]);
-	}
-
-	/** @param {string} message */
-	setStatus(message) {
-		this.items = [{ label: message }];
-		this.refresh();
-	}
-
-	/**
-	 * @param {string} owner
-	 * @param {RangeData} rangeData
-	 */
-	setRangeData(owner, rangeData) {
-		this.items = [{
-			label: RANGE_FILE_NAME,
-			description: `${owner}/${RANGE_REPOSITORY_NAME} (${RANGE_BRANCH})`,
-			children: rangeData.ranges.map((registration) => ({
-				label: `${registration.name} (${registration.publisher})`,
-				description: registration.id,
-				children: registration.ranges.map((range) => ({
-					label: `${range.from}-${range.to}`
-				}))
-			}))
-		}];
-		this.refresh();
-	}
-
-	/**
-	 * @param {DebugTreeItem} [element]
-	 * @returns {Promise<DebugTreeItem[]>}
-	 */
-	async getChildren(element) {
-		if (!element && !await hasAlWorkspace()) {
-			return [{ label: 'Open a valid AL workspace to load organization usage.' }];
-		}
-		return super.getChildren(element);
-	}
-}
-
-class GithubDebugDataProvider extends TreeDataProvider {
-	constructor() {
-		super();
-		/** @type {string[]} */
-		this.remarks = [];
-	}
-
-	/** @param {string[]} remarks */
-	setRemarks(remarks) {
-		this.remarks = remarks;
-		this.refresh();
-	}
-
-	/**
-	 * @param {DebugTreeItem} [element]
-	 * @returns {Promise<DebugTreeItem[]>}
-	 */
-	async getChildren(element) {
-		if (element) {
-			return element.children || [];
-		}
-		if (!await hasAlWorkspace()) {
-			return [{ label: 'Open a valid AL workspace to inspect GitHub accounts.' }];
-		}
-
-		try {
-			const [accounts, session] = await Promise.all([
-				vscode.authentication.getAccounts(GITHUB_AUTH_PROVIDER),
-				vscode.authentication.getSession(GITHUB_AUTH_PROVIDER, GITHUB_AUTH_SCOPES, { silent: true })
-			]);
-			const accountItems = accounts.length > 0
-				? accounts.map((account) => {
-					const selected = session?.account.id === account.id;
-					return {
-						label: account.label,
-						description: selected ? 'Selected GitHub account' : undefined,
-						isSelected: selected
-					};
-				})
-				: [{ label: 'No GitHub accounts are signed in.' }];
-			const repositoryOwnerItems = session
-				? await this.getRepositoryOwnerItems(session)
-				: [{ label: 'Selected GitHub account is not available to this extension.' }];
-
-			return [
-				{ label: 'GitHub accounts', children: accountItems },
-				{ label: 'Repository owner', children: repositoryOwnerItems },
-				{
-					label: 'Remarks',
-					children: this.remarks.length > 0
-						? this.remarks.map((remark) => ({ label: remark }))
-						: [{ label: `No remarks in ${RANGE_FILE_NAME}.` }]
-				}
-			];
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			return [{ label: `Unable to load GitHub debug data: ${message}` }];
-		}
-	}
-
-	/** @param {vscode.AuthenticationSession} session */
-	async getRepositoryOwnerItems(session) {
-		const headers = getGithubHeaders(session);
-		const user = /** @type {GitHubUser} */ (
-			await getGithubJson(`${GITHUB_API_URL}/user`, headers)
-		);
-		const organizations = await getGithubOrganizations(headers);
-		const selectedOwner = vscode.workspace
-			.getConfiguration('object-manager')
-			.get(REPOSITORY_OWNER_SETTING);
-		const selectedAccountId = vscode.workspace
-			.getConfiguration('object-manager')
-			.get(REPOSITORY_ACCOUNT_SETTING);
-		const owners = [
-			{ login: user.login, type: 'Personal account' },
-			...organizations.map((organization) => ({ login: organization.login, type: 'Organization' }))
-		];
-
-		return owners.map((owner) => {
-			const selected = selectedAccountId === session.account.id && selectedOwner === owner.login;
-			return {
-				label: owner.login,
-				description: `${owner.type}${selected ? ` selected for ${RANGE_REPOSITORY_DISPLAY_NAME}` : ''}`,
-				isSelected: selected
-			};
-		});
-	}
 }
 
 // This method is called when your extension is deactivated
