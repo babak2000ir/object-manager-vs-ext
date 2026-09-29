@@ -36,21 +36,23 @@ function activate(context) {
 	console.log('Congratulations, your extension "object-manager" is now active!');
 	const debugProvider = new GithubDebugDataProvider();
 	const organizationUsageProvider = new OrganizationUsageDataProvider();
-	let workspaceWasOpen = hasWorkspace();
-	if (workspaceWasOpen) {
-		void configureGithubRepositoryOwner(false, debugProvider, organizationUsageProvider);
+	let repositoryRefresh = Promise.resolve();
+	const refreshRepositoryState = (showAccountPicker = false) => {
+		const nextRefresh = repositoryRefresh
+			.then(() => configureGithubRepositoryOwner(showAccountPicker, debugProvider, organizationUsageProvider))
+			.catch((error) => console.error('Unable to refresh GitHub repository state:', error));
+		repositoryRefresh = nextRefresh;
+		return nextRefresh;
+	};
+	if (hasWorkspace()) {
+		void refreshRepositoryState();
 	}
 	const workspaceChangeListener = vscode.workspace.onDidChangeWorkspaceFolders(() => {
-		const workspaceIsOpen = hasWorkspace();
-		if (!workspaceWasOpen && workspaceIsOpen) {
-			void configureGithubRepositoryOwner(false, debugProvider, organizationUsageProvider);
-		}
-		workspaceWasOpen = workspaceIsOpen;
-		debugProvider.refresh();
+		void refreshRepositoryState();
 	});
 	const authenticationChangeListener = vscode.authentication.onDidChangeSessions((event) => {
 		if (event.provider.id === GITHUB_AUTH_PROVIDER) {
-			debugProvider.refresh();
+			void refreshRepositoryState();
 		}
 	});
 	const configurationChangeListener = vscode.workspace.onDidChangeConfiguration((event) => {
@@ -58,9 +60,13 @@ function activate(context) {
 			event.affectsConfiguration(`object-manager.${REPOSITORY_OWNER_SETTING}`) ||
 			event.affectsConfiguration(`object-manager.${REPOSITORY_ACCOUNT_SETTING}`)
 		) {
-			debugProvider.refresh();
+			void refreshRepositoryState();
 		}
 	});
+	const repositoryCheckTimer = setInterval(
+		() => void refreshRepositoryState(),
+		getRepositoryCheckIntervalMs()
+	);
 
 	// The command has been defined in the package.json file
 	// Now provide the implementation of the command with  registerCommand
@@ -73,7 +79,7 @@ function activate(context) {
 	});
 	const manageAccountPreference = vscode.commands.registerCommand(
 		'object-manager.manageAccountPreference',
-		() => configureGithubRepositoryOwner(true, debugProvider, organizationUsageProvider)
+		() => refreshRepositoryState(true)
 	);
 
 	context.subscriptions.push(
@@ -82,6 +88,7 @@ function activate(context) {
 		workspaceChangeListener,
 		authenticationChangeListener,
 		configurationChangeListener,
+		{ dispose: () => clearInterval(repositoryCheckTimer) },
 		vscode.window.registerTreeDataProvider('object-manager.commands', new TreeDataProvider([
 			{ label: 'Hello World', command: 'object-manager.helloWorld' }
 		])),
@@ -95,6 +102,13 @@ function activate(context) {
 
 function hasWorkspace() {
 	return Boolean(vscode.workspace.workspaceFile || vscode.workspace.workspaceFolders?.length);
+}
+
+function getRepositoryCheckIntervalMs() {
+	const intervalMinutes = vscode.workspace
+		.getConfiguration('object-manager')
+		.get('repositoryCheckIntervalMinutes', 5);
+	return Math.max(1, Number(intervalMinutes)) * 60 * 1000;
 }
 
 function selectGithubAccount(showAccountPicker = false) {
@@ -136,6 +150,7 @@ async function configureGithubRepositoryOwner(showAccountPicker = false, debugPr
 	try {
 		const session = await selectGithubAccount(showAccountPicker);
 		if (!session) {
+			organizationUsageProvider?.setStatus(`Select a GitHub account to load ${RANGE_FILE_NAME}.`);
 			return;
 		}
 
