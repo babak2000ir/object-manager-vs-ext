@@ -41,6 +41,21 @@ function isObjectIdInRanges(objectId, ranges) {
 	);
 }
 
+/** @param {unknown} left @param {unknown} right */
+function areRangesEqual(left, right) {
+	if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
+		return false;
+	}
+	const sortRanges = (ranges) => [...ranges].sort((first, second) =>
+		(first?.from ?? 0) - (second?.from ?? 0) || (first?.to ?? 0) - (second?.to ?? 0)
+	);
+	const sortedLeft = sortRanges(left);
+	const sortedRight = sortRanges(right);
+	return sortedLeft.every((range, index) =>
+		range?.from === sortedRight[index]?.from && range?.to === sortedRight[index]?.to
+	);
+}
+
 /** @param {ExtensionObject} object */
 function getExtensionObjectKey(object) {
 	return `${object['object type']}:${object['object id']}`;
@@ -74,6 +89,7 @@ function classifyObjectSyncStatus(object, ranges, remoteRecord) {
 module.exports = {
 	parseAlObjects,
 	isObjectIdInRanges,
+	areRangesEqual,
 	getExtensionObjectKey,
 	normalizeObjectFilename,
 	classifyObjectSyncStatus

@@ -22,38 +22,55 @@
   "contributes": {
     "commands": [
       {
-        "command": "object-manager.helloWorld",
-        "title": "Hello World"
-      },
-      {
         "command": "object-manager.manageAccountPreference",
-        "title": "Manage Extension Account Preference"
+        "title": "Object Manager: Manage Account Preference"
       },
       {
         "command": "object-manager.createUpdateApplicationRange",
-        "title": "Create/Update Application Range"
+        "title": "Object Manager: Create or Update Application Range"
+      },
+      {
+        "command": "object-manager.forceApplicationRangeToRepository",
+        "title": "Object Manager: Force app.json Range to data.json",
+        "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "object-manager.forceApplicationRangeToRepositoryBusy",
+        "title": "Object Manager: Updating app.json Range",
+        "icon": "$(loading~spin)"
       },
       {
         "command": "object-manager.syncObjectReservation",
-        "title": "Sync Object Reservation",
+        "title": "Object Manager: Sync Object Reservation",
         "icon": "$(cloud-upload)"
       },
       {
         "command": "object-manager.syncObjectReservationBusy",
-        "title": "Syncing Object Reservation",
+        "title": "Object Manager: Syncing Object Reservation",
         "icon": "$(loading~spin)"
       },
       {
         "command": "object-manager.installGitValidationHooks",
-        "title": "Install Object Validation Git Hooks"
+        "title": "Object Manager: Install Git Validation Hooks"
       },
       {
         "command": "object-manager.removeGitValidationHooks",
-        "title": "Remove Object Validation Git Hooks"
+        "title": "Object Manager: Remove Git Validation Hooks"
       }
     ],
     "menus": {
       "view/item/context": [
+        {
+          "command": "object-manager.forceApplicationRangeToRepository",
+          "when": "view == object-manager.organizationUsage && viewItem == mismatchedApplicationRange",
+          "group": "inline"
+        },
+        {
+          "command": "object-manager.forceApplicationRangeToRepositoryBusy",
+          "when": "view == object-manager.organizationUsage && viewItem == forcingApplicationRange",
+          "group": "inline",
+          "enablement": "false"
+        },
         {
           "command": "object-manager.syncObjectReservation",
           "when": "view == object-manager.extensionUsage && viewItem == unsyncedObject",

@@ -8,3 +8,4 @@ Architecture is good? Anything missing, make it better, make it easier to mainta
 checkuser friendlyness and usecases check, specially aganist generla highl vel usage.
 Documentation.
 action to refresh app: Extension Usage
+sync range with app.json

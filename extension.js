@@ -11,6 +11,7 @@ const { promisify } = require('util');
 const {
 	parseAlObjects,
 	isObjectIdInRanges,
+	areRangesEqual,
 	normalizeObjectFilename,
 	classifyObjectSyncStatus
 } = require('./object-model');
@@ -37,6 +38,7 @@ const APP_ID_PATTERN = new RegExp(EXTENSION_CONFIG.workspace.appIdPattern, 'i');
 const execFileAsync = promisify(execFile);
 const GIT_HOOKS = ['pre-commit', 'pre-push'];
 const GIT_HOOK_MARKER = 'object-manager-validation-hook';
+const promptedRangeMismatches = new Set();
 let disposeActiveFeatures = () => {};
 
 /** @typedef {{ login: string }} GitHubUser */
@@ -46,6 +48,7 @@ let disposeActiveFeatures = () => {};
 /** @typedef {{ object: { sha: string } }} GitHubReference */
 /** @typedef {{ id: string, name: string, publisher: string, ranges: Array<{ from: number, to: number }> }} RangeRegistration */
 /** @typedef {{ Remarks: string[], ranges: RangeRegistration[] }} RangeData */
+/** @typedef {{ rangeOwner?: string, applicationId?: string }} ApplicationRangeTreeItem */
 /** @typedef {{ 'object type': string, 'object name': string, 'object id': string }} ExtensionObject */
 /** @typedef {'outOfRange' | 'conflict' | 'synced' | 'unsynced' | 'checking' | 'unavailable'} ObjectSyncStatus */
 /** @typedef {ExtensionObject & { syncStatus: ObjectSyncStatus }} ExtensionUsageEntry */
@@ -258,15 +261,6 @@ function startFeatures(featureDisposables) {
 		}
 	};
 
-	// The command has been defined in the package.json file
-	// Now provide the implementation of the command with  registerCommand
-	// The commandId parameter must match the command field in package.json
-	const disposable = vscode.commands.registerCommand('object-manager.helloWorld', function () {
-		// The code you place here will be executed every time your command is executed
-
-		// Display a message box to the user
-		vscode.window.showInformationMessage('Hello World from object-manager!');
-	});
 	const manageAccountPreference = vscode.commands.registerCommand(
 		'object-manager.manageAccountPreference',
 		() => refreshRepositoryState(true)
@@ -274,6 +268,65 @@ function startFeatures(featureDisposables) {
 	const createUpdateApplicationRange = vscode.commands.registerCommand(
 		'object-manager.createUpdateApplicationRange',
 		() => refreshRepositoryState(false, true)
+	);
+	const forceApplicationRangeToRepository = vscode.commands.registerCommand(
+		'object-manager.forceApplicationRangeToRepository',
+		async (treeItem) => {
+			let syncingOwner;
+			let syncingApplicationId;
+			try {
+				const appManifest = await getAlApplicationManifest();
+				if (!appManifest || !Array.isArray(appManifest.manifest.idRanges)) {
+					vscode.window.showErrorMessage(`Unable to update ${RANGE_FILE_NAME} because ${EXTENSION_CONFIG.workspace.appManifestFileName} has no valid idRanges.`);
+					return;
+				}
+				const rangeTreeItem = /** @type {ApplicationRangeTreeItem | undefined} */ (treeItem);
+				if (
+					!rangeTreeItem ||
+					rangeTreeItem.applicationId !== appManifest.manifest.id ||
+					typeof rangeTreeItem.rangeOwner !== 'string'
+				) {
+					return;
+				}
+				syncingOwner = rangeTreeItem.rangeOwner;
+				syncingApplicationId = rangeTreeItem.applicationId;
+				organizationUsageProvider.setRangeSyncing(syncingOwner, syncingApplicationId, true);
+				const session = await selectGithubAccount();
+				if (!session) {
+					throw new Error('Sign in to GitHub before updating the application range.');
+				}
+				const configuration = vscode.workspace.getConfiguration('object-manager');
+				const owner = configuration.get(REPOSITORY_OWNER_SETTING);
+				const accountId = configuration.get(REPOSITORY_ACCOUNT_SETTING);
+				if (typeof owner !== 'string' || owner !== rangeTreeItem.rangeOwner || accountId !== session.account.id) {
+					vscode.window.showInformationMessage('Refresh organization usage and select its repository owner before updating this range.');
+					await refreshRepositoryState(true);
+					return;
+				}
+
+				const registration = createApplicationRegistration(appManifest.manifest);
+				const changed = await forceApplicationRangeToRepositoryData(
+					owner,
+					registration,
+					getGithubHeaders(session)
+				);
+				vscode.window.showInformationMessage(
+					changed ? `Updated ${RANGE_FILE_NAME} with the ${EXTENSION_CONFIG.workspace.appManifestFileName} range.` : `${RANGE_FILE_NAME} already has the ${EXTENSION_CONFIG.workspace.appManifestFileName} range.`
+				);
+				await refreshRepositoryState();
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				vscode.window.showErrorMessage(`Unable to update ${RANGE_FILE_NAME} with the application range: ${message}`);
+			} finally {
+				if (syncingOwner && syncingApplicationId) {
+					organizationUsageProvider.setRangeSyncing(syncingOwner, syncingApplicationId, false);
+				}
+			}
+		}
+	);
+	const forceApplicationRangeToRepositoryBusy = vscode.commands.registerCommand(
+		'object-manager.forceApplicationRangeToRepositoryBusy',
+		() => undefined
 	);
 	const syncObjectReservation = vscode.commands.registerCommand(
 		'object-manager.syncObjectReservation',
@@ -374,9 +427,10 @@ function startFeatures(featureDisposables) {
 	);
 
 	featureDisposables.push(
-		disposable,
 		manageAccountPreference,
 		createUpdateApplicationRange,
+		forceApplicationRangeToRepository,
+		forceApplicationRangeToRepositoryBusy,
 		syncObjectReservation,
 		syncObjectReservationBusy,
 		installGitValidationHooks,
@@ -396,7 +450,11 @@ function startFeatures(featureDisposables) {
 		configurationChangeListener,
 		{ dispose: () => clearInterval(repositoryCheckTimer) },
 		vscode.window.registerTreeDataProvider('object-manager.commands', new TreeDataProvider([
-			{ label: 'Hello World', command: 'object-manager.helloWorld' }
+			{ label: 'Object Manager: Manage Account Preference', command: 'object-manager.manageAccountPreference' },
+			{ label: 'Object Manager: Create or Update Application Range', command: 'object-manager.createUpdateApplicationRange' },
+			{ label: 'Object Manager: Sync Object Reservation', command: 'object-manager.syncObjectReservation' },
+			{ label: 'Object Manager: Install Git Validation Hooks', command: 'object-manager.installGitValidationHooks' },
+			{ label: 'Object Manager: Remove Git Validation Hooks', command: 'object-manager.removeGitValidationHooks' }
 		])),
 		vscode.window.registerTreeDataProvider('object-manager.extensionUsage', extensionUsageProvider),
 		vscode.window.registerTreeDataProvider('object-manager.organizationUsage', organizationUsageProvider),
@@ -1036,8 +1094,11 @@ async function ensureRangeRepository(
 	}
 
 	const appManifest = await getAlApplicationManifest();
-	if (appManifest) {
-		const registration = createApplicationRegistration(appManifest.manifest);
+	const applicationRegistration = appManifest
+		? createApplicationRegistration(appManifest.manifest)
+		: undefined;
+	if (appManifest && applicationRegistration) {
+		const registration = applicationRegistration;
 		const existingRegistration = rangeData.ranges.find((item) => item.id === registration.id);
 		if (existingRegistration) {
 			rangeDiagnostics?.delete(appManifest.uri);
@@ -1096,6 +1157,25 @@ async function ensureRangeRepository(
 				}
 			}
 		}
+		const repositoryRegistration = rangeData.ranges.find((item) => item.id === applicationRegistration.id);
+		if (repositoryRegistration && !areRangesEqual(applicationRegistration.ranges, repositoryRegistration.ranges)) {
+			const promptKey = `${owner}:${applicationRegistration.id}:${JSON.stringify(applicationRegistration.ranges)}:${JSON.stringify(repositoryRegistration.ranges)}`;
+			if (!promptedRangeMismatches.has(promptKey)) {
+				promptedRangeMismatches.add(promptKey);
+				const useRepositoryRange = 'Update app.json from data.json';
+				const keepApplicationRange = 'Keep app.json range';
+				const selection = await vscode.window.showWarningMessage(
+					`The ${RANGE_FILE_NAME} range for ${applicationRegistration.name} differs from app.json. Use the upstream range in app.json?`,
+					useRepositoryRange,
+					keepApplicationRange
+				);
+				if (selection === useRepositoryRange) {
+					await updateApplicationManifestRanges(appManifest, repositoryRegistration.ranges);
+					applicationRegistration.ranges = repositoryRegistration.ranges;
+					appManifest.manifest.idRanges = repositoryRegistration.ranges;
+				}
+			}
+		}
 		const localObjects = extensionUsageProvider?.getObjects() || await collectExtensionObjects();
 		const syncStatuses = await getApplicationObjectStatuses(
 			repositoryUrl,
@@ -1106,8 +1186,50 @@ async function ensureRangeRepository(
 		extensionUsageProvider?.setSyncStatuses(syncStatuses);
 	}
 
-	organizationUsageProvider?.setRangeData(owner, rangeData);
+	organizationUsageProvider?.setRangeData(owner, rangeData, applicationRegistration);
 	debugProvider?.setRemarks(rangeData.Remarks);
+}
+
+/**
+ * @param {string} owner
+ * @param {RangeRegistration} registration
+ * @param {GitHubApiHeaders} headers
+ */
+async function forceApplicationRangeToRepositoryData(owner, registration, headers) {
+	const repositoryUrl = `${GITHUB_API_URL}/repos/${encodeURIComponent(owner)}/${RANGE_REPOSITORY_NAME}`;
+	const contentsUrl = `${repositoryUrl}/contents/${encodeURIComponent(RANGE_FILE_NAME)}`;
+	const latestResponse = await fetch(`${contentsUrl}?ref=${encodeURIComponent(RANGE_BRANCH)}`, { headers });
+	if (!latestResponse.ok) {
+		throw new Error(await getGithubResponseError(latestResponse));
+	}
+	const latestFile = /** @type {GitHubContentsFile} */ (await latestResponse.json());
+	const latestData = parseRangeData(latestFile);
+	const registrationIndex = latestData.ranges.findIndex((item) => item.id === registration.id);
+	if (registrationIndex < 0) {
+		throw new Error(`The application is no longer registered in ${RANGE_FILE_NAME}. Refresh organization usage and try again.`);
+	}
+	if (areRangesEqual(latestData.ranges[registrationIndex].ranges, registration.ranges)) {
+		return false;
+	}
+
+	latestData.ranges[registrationIndex] = {
+		...latestData.ranges[registrationIndex],
+		ranges: registration.ranges
+	};
+	const updateResponse = await fetch(contentsUrl, {
+		method: 'PUT',
+		headers,
+		body: JSON.stringify({
+			message: `Update ${registration.name} application range`,
+			content: Buffer.from(JSON.stringify(latestData, null, 4)).toString('base64'),
+			sha: latestFile.sha,
+			branch: RANGE_BRANCH
+		})
+	});
+	if (!updateResponse.ok) {
+		throw new Error(await getGithubResponseError(updateResponse));
+	}
+	return true;
 }
 
 /** @param {GitHubContentsFile} file @returns {RangeData} */
@@ -1147,6 +1269,20 @@ async function getAlApplicationManifest() {
 		} catch {}
 	}
 	return undefined;
+}
+
+/** @param {{ uri: vscode.Uri, manifest: Record<string, any> }} appManifest @param {Array<{ from: number, to: number }>} ranges */
+async function updateApplicationManifestRanges(appManifest, ranges) {
+	const content = await vscode.workspace.fs.readFile(appManifest.uri);
+	const currentManifest = JSON.parse(Buffer.from(content).toString('utf8'));
+	if (currentManifest.id !== appManifest.manifest.id) {
+		throw new Error('The application manifest changed before its range could be updated.');
+	}
+	currentManifest.idRanges = ranges;
+	await vscode.workspace.fs.writeFile(
+		appManifest.uri,
+		Buffer.from(JSON.stringify(currentManifest, null, 4))
+	);
 }
 
 /** @param {vscode.DiagnosticCollection | undefined} diagnostics @param {vscode.Uri} uri */
@@ -1249,6 +1385,8 @@ module.exports = {
 	isValidAlManifest,
 	hasAlWorkspace,
 	createApplicationRegistration,
+	areRangesEqual,
+	forceApplicationRangeToRepositoryData,
 	parseAlObjects,
 	collectExtensionObjects,
 	isObjectIdInRanges,

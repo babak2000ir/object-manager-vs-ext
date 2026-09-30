@@ -11,9 +11,11 @@ const execFileAsync = promisify(execFile);
 const vscode = require('vscode');
 const EXTENSION_CONFIG = require('../config.json');
 const { activateOnTriggers } = require('../feature-lifecycle');
+const { OrganizationUsageDataProvider } = require('../tree-data-providers');
 const {
 	hasAlWorkspace,
 	createApplicationRegistration,
+	areRangesEqual,
 	parseAlObjects,
 	isObjectIdInRanges,
 	classifyObjectSyncStatus,
@@ -23,7 +25,8 @@ const {
 	startValidationServer,
 	prepareGitHookInstallation,
 	installGitValidationHooksForRepository,
-	checkAndUploadApplicationObject
+	checkAndUploadApplicationObject,
+	forceApplicationRangeToRepositoryData
 } = require('../extension');
 
 suite('Extension Test Suite', () => {
@@ -103,6 +106,108 @@ suite('Extension Test Suite', () => {
 			publisher: manifest.publisher,
 			ranges: manifest.idRanges
 		});
+	});
+
+	test('Compares application ranges without depending on their order', () => {
+		assert.strictEqual(areRangesEqual(
+			[{ from: 50000, to: 50099 }, { from: 60000, to: 60099 }],
+			[{ from: 60000, to: 60099 }, { from: 50000, to: 50099 }]
+		), true);
+		assert.strictEqual(areRangesEqual([{ from: 50000, to: 50099 }], [{ from: 50000, to: 50100 }]), false);
+	});
+
+	test('Marks app.json ranges and adds the inline action when ranges differ', async () => {
+		const provider = new OrganizationUsageDataProvider(async () => true);
+		provider.setRangeData('example', {
+			Remarks: [],
+			ranges: [{
+				id: 'target',
+				name: 'Target',
+				publisher: 'Publisher',
+				ranges: [{ from: 51000, to: 51099 }]
+			}]
+		}, {
+			id: 'target',
+			ranges: [{ from: 50000, to: 50099 }]
+		});
+
+		const [root] = await provider.getChildren();
+		const [registration] = root.children;
+		const [applicationRange, repositoryRange] = registration.children;
+		assert.strictEqual(applicationRange.label, 'app.json: 50000-50099');
+		assert.strictEqual(applicationRange.syncStatus, 'outOfRange');
+		assert.strictEqual(applicationRange.contextValue, 'mismatchedApplicationRange');
+		assert.strictEqual(applicationRange.rangeOwner, 'example');
+		assert.strictEqual(applicationRange.applicationId, 'target');
+		assert.strictEqual(repositoryRange.label, 'data.json: 51000-51099');
+		assert.strictEqual(provider.getTreeItem(applicationRange).iconPath.id, 'close');
+
+		provider.setRangeSyncing('example', 'target', true);
+		const [busyRoot] = await provider.getChildren();
+		const [busyRegistration] = busyRoot.children;
+		const [busyApplicationRange] = busyRegistration.children;
+		assert.strictEqual(busyApplicationRange.contextValue, 'forcingApplicationRange');
+
+		provider.setRangeData('example', {
+			Remarks: [],
+			ranges: [{
+				id: 'target',
+				name: 'Target',
+				publisher: 'Publisher',
+				ranges: [{ from: 50000, to: 50099 }]
+			}]
+		}, {
+			id: 'target',
+			ranges: [{ from: 50000, to: 50099 }]
+		});
+		const [matchingRoot] = await provider.getChildren();
+		const [matchingRegistration] = matchingRoot.children;
+		const [matchingApplicationRange] = matchingRegistration.children;
+		assert.strictEqual(matchingApplicationRange.syncStatus, 'synced');
+		assert.strictEqual(provider.getTreeItem(matchingApplicationRange).iconPath.id, 'check');
+		assert.strictEqual(matchingApplicationRange.contextValue, undefined);
+	});
+
+	test('Forces only the selected registration range into data.json', async () => {
+		const originalFetch = global.fetch;
+		const originalData = {
+			Remarks: ['Keep this remark'],
+			ranges: [
+				{ id: 'target', name: 'Target', publisher: 'Publisher', ranges: [{ from: 51000, to: 51099 }] },
+				{ id: 'other', name: 'Other', publisher: 'Publisher', ranges: [{ from: 52000, to: 52099 }] }
+			]
+		};
+		const requests = [];
+		try {
+			global.fetch = async (url, options = {}) => {
+				requests.push({ url, options });
+				if (options.method === 'PUT') {
+					return new Response('{}', { status: 200 });
+				}
+				return new Response(JSON.stringify({
+					content: Buffer.from(JSON.stringify(originalData)).toString('base64'),
+					sha: 'current-sha'
+				}), { status: 200 });
+			};
+
+			const changed = await forceApplicationRangeToRepositoryData('example', {
+				id: 'target',
+				name: 'Target',
+				publisher: 'Publisher',
+				ranges: [{ from: 50000, to: 50099 }]
+			}, {});
+
+			assert.strictEqual(changed, true);
+			assert.strictEqual(requests.length, 2);
+			const update = JSON.parse(requests[1].options.body);
+			const updatedData = JSON.parse(Buffer.from(update.content, 'base64').toString('utf8'));
+			assert.strictEqual(update.sha, 'current-sha');
+			assert.deepStrictEqual(updatedData.Remarks, originalData.Remarks);
+			assert.deepStrictEqual(updatedData.ranges[0].ranges, [{ from: 50000, to: 50099 }]);
+			assert.deepStrictEqual(updatedData.ranges[1], originalData.ranges[1]);
+		} finally {
+			global.fetch = originalFetch;
+		}
 	});
 
 	test('Finds supported AL objects in files with comments and namespaces', () => {

@@ -1,6 +1,6 @@
 const vscode = require('vscode');
 const EXTENSION_CONFIG = require('./config.json');
-const { getExtensionObjectKey, isObjectIdInRanges } = require('./object-model');
+const { getExtensionObjectKey, isObjectIdInRanges, areRangesEqual } = require('./object-model');
 
 const RANGE_REPOSITORY_NAME = EXTENSION_CONFIG.rangeRepository.name;
 const RANGE_REPOSITORY_DISPLAY_NAME = EXTENSION_CONFIG.rangeRepository.displayName;
@@ -213,6 +213,24 @@ class OrganizationUsageDataProvider extends TreeDataProvider {
 	constructor(hasAlWorkspace) {
 		super([{ label: 'Waiting for GitHub account selection.' }]);
 		this.hasAlWorkspace = hasAlWorkspace;
+		/** @type {string | undefined} */
+		this.syncingRangeKey = undefined;
+		/** @type {string | undefined} */
+		this.rangeOwner = undefined;
+		/** @type {{ Remarks: string[], ranges: Array<{ id: string, name: string, publisher: string, ranges: Array<{ from: number, to: number }> }> } | undefined} */
+		this.rangeData = undefined;
+		/** @type {{ id: string, ranges: Array<{ from: number, to: number }> } | undefined} */
+		this.applicationRegistration = undefined;
+	}
+
+	/** @param {string} owner @param {string} applicationId @param {boolean} syncing */
+	setRangeSyncing(owner, applicationId, syncing) {
+		this.syncingRangeKey = syncing ? `${owner}:${applicationId}` : undefined;
+		if (this.rangeOwner && this.rangeData) {
+			this.setRangeData(this.rangeOwner, this.rangeData, this.applicationRegistration);
+		} else {
+			this.refresh();
+		}
 	}
 
 	/** @param {string} message */
@@ -221,16 +239,55 @@ class OrganizationUsageDataProvider extends TreeDataProvider {
 		this.refresh();
 	}
 
-	/** @param {string} owner @param {{ Remarks: string[], ranges: Array<{ id: string, name: string, publisher: string, ranges: Array<{ from: number, to: number }> }> }} rangeData */
-	setRangeData(owner, rangeData) {
+	/** @param {string} owner @param {{ Remarks: string[], ranges: Array<{ id: string, name: string, publisher: string, ranges: Array<{ from: number, to: number }> }> }} rangeData @param {{ id: string, ranges: Array<{ from: number, to: number }> } | undefined} applicationRegistration */
+	setRangeData(owner, rangeData, applicationRegistration) {
+		this.rangeOwner = owner;
+		this.rangeData = rangeData;
+		this.applicationRegistration = applicationRegistration;
 		this.items = [{
 			label: RANGE_FILE_NAME,
 			description: `${owner}/${RANGE_REPOSITORY_NAME} (${RANGE_BRANCH})`,
-			children: rangeData.ranges.map((registration) => ({
-				label: `${registration.name} (${registration.publisher})`,
-				description: registration.id,
-				children: registration.ranges.map((range) => ({ label: `${range.from}-${range.to}` }))
-			}))
+			children: rangeData.ranges.map((registration) => {
+				const isCurrentApplication = applicationRegistration?.id === registration.id;
+				const rangeMismatch = isCurrentApplication &&
+					!areRangesEqual(applicationRegistration.ranges, registration.ranges);
+				const isSyncing = this.syncingRangeKey === `${owner}:${registration.id}`;
+				if (isCurrentApplication) {
+					const contextValue = rangeMismatch
+						? isSyncing ? 'forcingApplicationRange' : 'mismatchedApplicationRange'
+						: undefined;
+					const applicationRanges = applicationRegistration.ranges.length > 0
+						? applicationRegistration.ranges.map((range) => ({
+							label: `app.json: ${range.from}-${range.to}`,
+							syncStatus: rangeMismatch ? 'outOfRange' : 'synced',
+							contextValue,
+							rangeOwner: owner,
+							applicationId: registration.id
+						}))
+						: [{
+							label: 'app.json: no ranges',
+							syncStatus: rangeMismatch ? 'outOfRange' : 'synced',
+							contextValue,
+							rangeOwner: owner,
+							applicationId: registration.id
+						}];
+					return {
+						label: `${registration.name} (${registration.publisher})`,
+						description: registration.id,
+						children: rangeMismatch
+							? [
+								...applicationRanges,
+								...registration.ranges.map((range) => ({ label: `data.json: ${range.from}-${range.to}` }))
+							]
+							: applicationRanges
+					};
+				}
+				return {
+					label: `${registration.name} (${registration.publisher})`,
+					description: registration.id,
+					children: registration.ranges.map((range) => ({ label: `${range.from}-${range.to}` }))
+				};
+			})
 		}];
 		this.refresh();
 	}
