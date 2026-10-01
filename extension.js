@@ -59,7 +59,7 @@ let disposeActiveFeatures = () => {};
 /** @typedef {{ rootUri: vscode.Uri, onDidCommit: (listener: () => void) => vscode.Disposable }} GitRepository */
 /** @typedef {{ repositories: GitRepository[], onDidOpenRepository: (listener: (repository: GitRepository) => void) => vscode.Disposable }} GitApi */
 /** @typedef {{ url: string, token: string, dispose: () => void }} GitValidationServer */
-/** @typedef {{ label: string, description?: string, isSelected?: boolean, syncStatus?: ObjectSyncStatus, contextValue?: string, object?: ExtensionUsageEntry, command?: string, children?: DebugTreeItem[] }} DebugTreeItem */
+/** @typedef {{ label: string, description?: string, isSelected?: boolean, syncStatus?: ObjectSyncStatus, contextValue?: string, object?: ExtensionUsageEntry, command?: string, children?: DebugTreeItem[], rangeOwner?: string, applicationId?: string }} DebugTreeItem */
 
 // This method is called when your extension is activated
 // Your extension is activated the very first time the command is executed
@@ -121,7 +121,9 @@ function startFeatures(featureDisposables) {
 	const organizationUsageProvider = new OrganizationUsageDataProvider(hasAlWorkspace);
 	const extensionUsageProvider = new ExtensionUsageDataProvider();
 	const rangeDiagnostics = vscode.languages.createDiagnosticCollection('object-manager');
-	let extensionObjectRefresh = Promise.resolve();
+	/** @type {string | undefined} */
+		let currentApplicationId;
+		let extensionObjectRefresh = Promise.resolve();
 	const refreshExtensionObjects = () => {
 		const nextRefresh = extensionObjectRefresh
 			.then(async () => {
@@ -129,6 +131,7 @@ function startFeatures(featureDisposables) {
 					collectExtensionObjects(),
 					getAlApplicationManifest()
 				]);
+				currentApplicationId = appManifest?.manifest.id;
 				extensionUsageProvider.setObjects(objects, appManifest?.manifest.idRanges);
 			})
 			.catch((error) => console.error('Unable to refresh AL objects:', error));
@@ -149,7 +152,23 @@ function startFeatures(featureDisposables) {
 	const alFileChangeListener = alFileWatcher.onDidChange(refreshForAlFileChange);
 	const alFileCreateListener = alFileWatcher.onDidCreate(refreshForAlFileChange);
 	const alFileDeleteListener = alFileWatcher.onDidDelete(refreshForAlFileChange);
+	/** @param {vscode.Uri} uri */
+	const isAppManifestUri = (uri) => (vscode.workspace.workspaceFolders || []).some((folder) =>
+		path.resolve(folder.uri.fsPath, EXTENSION_CONFIG.workspace.appManifestFileName).toLowerCase() ===
+		path.resolve(uri.fsPath).toLowerCase()
+	);
 	const saveListener = vscode.workspace.onDidSaveTextDocument((document) => {
+		if (isAppManifestUri(document.uri)) {
+			try {
+					const savedManifest = JSON.parse(document.getText());
+					const savedApplicationId = typeof savedManifest.id === 'string' ? savedManifest.id : undefined;
+				if (savedApplicationId !== currentApplicationId) {
+					currentApplicationId = savedApplicationId;
+					void refreshExtensionObjects().then(() => refreshRepositoryState());
+				}
+			} catch {}
+			return;
+			}
 		if (document.uri.path.toLowerCase().endsWith(EXTENSION_CONFIG.workspace.alSourceExtension)) {
 			refreshForAlFileChange();
 		}

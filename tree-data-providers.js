@@ -17,7 +17,7 @@ const AL_OBJECT_TYPES = ['Table', 'Report', 'Codeunit', 'XMLport', 'MenuSuite', 
 /** @typedef {{ 'object type': string, 'object name': string, 'object id': string }} ExtensionObject */
 /** @typedef {'outOfRange' | 'conflict' | 'synced' | 'unsynced' | 'checking' | 'unavailable'} ObjectSyncStatus */
 /** @typedef {ExtensionObject & { syncStatus: ObjectSyncStatus }} ExtensionUsageEntry */
-/** @typedef {{ label: string, description?: string, isSelected?: boolean, syncStatus?: ObjectSyncStatus, contextValue?: string, object?: ExtensionUsageEntry, command?: string, children?: DebugTreeItem[] }} DebugTreeItem */
+/** @typedef {{ label: string, description?: string, isSelected?: boolean, syncStatus?: ObjectSyncStatus, contextValue?: string, object?: ExtensionUsageEntry, command?: string, children?: DebugTreeItem[], rangeOwner?: string, applicationId?: string }} DebugTreeItem */
 /** @typedef {{ login: string }} GitHubUser */
 /** @typedef {{ login: string }} GitHubOrganization */
 /** @typedef {Record<string, string>} GitHubApiHeaders */

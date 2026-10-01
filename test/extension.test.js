@@ -134,21 +134,33 @@ suite('Extension Test Suite', () => {
 			ranges: [{ from: 50000, to: 50099 }]
 		});
 
-		const [root] = await provider.getChildren();
-		const [registration] = root.children;
-		const [applicationRange, repositoryRange] = registration.children;
+		const root = (await provider.getChildren())[0];
+		assert.ok(root);
+		const [registration] = root.children ?? [];
+		assert.ok(registration);
+		const [applicationRange, repositoryRange] = registration.children ?? [];
+		assert.ok(applicationRange);
+		assert.ok(repositoryRange);
 		assert.strictEqual(applicationRange.label, 'app.json: 50000-50099');
 		assert.strictEqual(applicationRange.syncStatus, 'outOfRange');
 		assert.strictEqual(applicationRange.contextValue, 'mismatchedApplicationRange');
 		assert.strictEqual(applicationRange.rangeOwner, 'example');
 		assert.strictEqual(applicationRange.applicationId, 'target');
 		assert.strictEqual(repositoryRange.label, 'data.json: 51000-51099');
-		assert.strictEqual(provider.getTreeItem(applicationRange).iconPath.id, 'close');
+		const applicationIcon = provider.getTreeItem(applicationRange).iconPath;
+		assert.ok(applicationIcon);
+		const applicationIconId = typeof applicationIcon === 'string'
+			? applicationIcon
+			: 'id' in applicationIcon ? applicationIcon.id : undefined;
+		assert.strictEqual(applicationIconId, 'close');
 
 		provider.setRangeSyncing('example', 'target', true);
-		const [busyRoot] = await provider.getChildren();
-		const [busyRegistration] = busyRoot.children;
-		const [busyApplicationRange] = busyRegistration.children;
+		const busyRoot = (await provider.getChildren())[0];
+		assert.ok(busyRoot);
+		const [busyRegistration] = busyRoot.children ?? [];
+		assert.ok(busyRegistration);
+		const [busyApplicationRange] = busyRegistration.children ?? [];
+		assert.ok(busyApplicationRange);
 		assert.strictEqual(busyApplicationRange.contextValue, 'forcingApplicationRange');
 
 		provider.setRangeData('example', {
@@ -163,11 +175,19 @@ suite('Extension Test Suite', () => {
 			id: 'target',
 			ranges: [{ from: 50000, to: 50099 }]
 		});
-		const [matchingRoot] = await provider.getChildren();
-		const [matchingRegistration] = matchingRoot.children;
-		const [matchingApplicationRange] = matchingRegistration.children;
+		const matchingRoot = (await provider.getChildren())[0];
+		assert.ok(matchingRoot);
+		const [matchingRegistration] = matchingRoot.children ?? [];
+		assert.ok(matchingRegistration);
+		const [matchingApplicationRange] = matchingRegistration.children ?? [];
+		assert.ok(matchingApplicationRange);
 		assert.strictEqual(matchingApplicationRange.syncStatus, 'synced');
-		assert.strictEqual(provider.getTreeItem(matchingApplicationRange).iconPath.id, 'check');
+		const matchingIcon = provider.getTreeItem(matchingApplicationRange).iconPath;
+		assert.ok(matchingIcon);
+		const matchingIconId = typeof matchingIcon === 'string'
+			? matchingIcon
+			: 'id' in matchingIcon ? matchingIcon.id : undefined;
+		assert.strictEqual(matchingIconId, 'check');
 		assert.strictEqual(matchingApplicationRange.contextValue, undefined);
 	});
 
@@ -180,10 +200,11 @@ suite('Extension Test Suite', () => {
 				{ id: 'other', name: 'Other', publisher: 'Publisher', ranges: [{ from: 52000, to: 52099 }] }
 			]
 		};
+		/** @type {{ url: string, options: RequestInit }[]} */
 		const requests = [];
 		try {
 			global.fetch = async (url, options = {}) => {
-				requests.push({ url, options });
+				requests.push({ url: String(url), options });
 				if (options.method === 'PUT') {
 					return new Response('{}', { status: 200 });
 				}
@@ -202,7 +223,8 @@ suite('Extension Test Suite', () => {
 
 			assert.strictEqual(changed, true);
 			assert.strictEqual(requests.length, 2);
-			const update = JSON.parse(requests[1].options.body);
+			assert.ok(requests[1].options.body);
+			const update = JSON.parse(String(requests[1].options.body));
 			const updatedData = JSON.parse(Buffer.from(update.content, 'base64').toString('utf8'));
 			assert.strictEqual(update.sha, 'current-sha');
 			assert.deepStrictEqual(updatedData.Remarks, originalData.Remarks);
@@ -470,6 +492,7 @@ query 50105 CustomerQuery {}`;
 		const provider = new (require('../tree-data-providers').ExtensionUsageDataProvider)();
 		provider.setObjects(objects, ranges);
 		provider.setSyncStatuses(statuses);
+		/** @type {{ url: string, options: RequestInit }[]} */
 		const requests = [];
 		try {
 			global.fetch = async (url, options = {}) => {
