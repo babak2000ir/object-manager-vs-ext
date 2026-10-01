@@ -38,6 +38,7 @@ const OBJECT_RESERVATION_DIRECTORY = EXTENSION_CONFIG.rangeRepository.objectRese
 const INITIAL_RANGE_DATA = EXTENSION_CONFIG.rangeRepository.initialData;
 const REPOSITORY_OWNER_SETTING = EXTENSION_CONFIG.settings.repositoryOwner;
 const REPOSITORY_ACCOUNT_SETTING = EXTENSION_CONFIG.settings.repositoryAccountId;
+const REPOSITORY_OWNER_SOURCE_SETTING = EXTENSION_CONFIG.settings.repositoryOwnerSource;
 const APP_ID_PATTERN = new RegExp(EXTENSION_CONFIG.workspace.appIdPattern, 'i');
 const execFileAsync = promisify(execFile);
 const GIT_HOOKS = ['pre-commit', 'pre-push'];
@@ -191,6 +192,7 @@ function startFeatures(featureDisposables) {
 	});
 	void refreshExtensionObjects();
 	let repositoryRefresh = Promise.resolve();
+	let resettingGithubSelection = false;
 	const refreshRepositoryState = (showAccountPicker = false, manualRangeUpdate = false) => {
 		const nextRefresh = repositoryRefresh
 			.then(async () => {
@@ -216,8 +218,11 @@ function startFeatures(featureDisposables) {
 	});
 	const configurationChangeListener = vscode.workspace.onDidChangeConfiguration((event) => {
 		if (
-			event.affectsConfiguration(`object-manager.${REPOSITORY_OWNER_SETTING}`) ||
-			event.affectsConfiguration(`object-manager.${REPOSITORY_ACCOUNT_SETTING}`)
+			!resettingGithubSelection &&
+			(
+				event.affectsConfiguration(`object-manager.${REPOSITORY_OWNER_SETTING}`) ||
+				event.affectsConfiguration(`object-manager.${REPOSITORY_ACCOUNT_SETTING}`)
+			)
 		) {
 			void refreshRepositoryState();
 		}
@@ -286,7 +291,15 @@ function startFeatures(featureDisposables) {
 
 	const manageAccountPreference = vscode.commands.registerCommand(
 		'object-manager.manageAccountPreference',
-		() => refreshRepositoryState(true)
+		async () => {
+			resettingGithubSelection = true;
+			try {
+				await clearRepositoryOwner();
+				await refreshRepositoryState(true);
+			} finally {
+				resettingGithubSelection = false;
+			}
+		}
 	);
 	const createUpdateApplicationRange = vscode.commands.registerCommand(
 		'object-manager.createUpdateApplicationRange',
@@ -619,7 +632,7 @@ function startFeatures(featureDisposables) {
 		configurationChangeListener,
 		{ dispose: () => clearInterval(repositoryCheckTimer) },
 		vscode.window.registerTreeDataProvider('object-manager.commands', new TreeDataProvider([
-			{ label: 'Object Manager: Manage Account Preference', command: 'object-manager.manageAccountPreference' },
+			{ label: 'Object Manager: Reset GitHub Account and Organization Selection', command: 'object-manager.manageAccountPreference' },
 			{ label: 'Object Manager: Create or Update Application Range', command: 'object-manager.createUpdateApplicationRange' },
 			{ label: 'Object Manager: Sync Object Reservation', command: 'object-manager.syncObjectReservation' },
 			{ label: 'Object Manager: Sync Existing Repository Objects', command: 'object-manager.syncRepositoryObjects' },
@@ -819,6 +832,64 @@ async function getGitRepositories() {
 function isPathWithin(parentPath, childPath) {
 	const relativePath = path.relative(parentPath, childPath);
 	return relativePath === '' || (!relativePath.startsWith(`..${path.sep}`) && relativePath !== '..' && !path.isAbsolute(relativePath));
+}
+
+/** @param {string} remoteUrl */
+function getGithubOwnerFromRemote(remoteUrl) {
+	const scpMatch = /^(?:[^@/]+@)?github\.com:([^/]+)\/([^/]+?)(?:\.git)?$/i.exec(remoteUrl);
+	let host;
+	let repositoryPath;
+	if (scpMatch) {
+		host = 'github.com';
+		repositoryPath = `/${scpMatch[1]}/${scpMatch[2]}`;
+	} else {
+		try {
+			const remote = new URL(remoteUrl);
+			host = remote.hostname.toLowerCase();
+			repositoryPath = remote.pathname;
+		} catch {
+			return undefined;
+		}
+	}
+	if (host !== 'github.com') {
+		return undefined;
+	}
+	const repositorySegments = repositoryPath.split('/').filter(Boolean);
+	if (repositorySegments.length !== 2) {
+		return undefined;
+	}
+	const [owner] = repositorySegments;
+	try {
+		return decodeURIComponent(owner);
+	} catch {
+		return undefined;
+	}
+}
+
+/** @param {{ uri: vscode.Uri }} appManifest */
+async function getApplicationRemoteOwner(appManifest) {
+	try {
+		const appDirectory = path.dirname(appManifest.uri.fsPath);
+		const repositories = (await getGitRepositories())
+			.filter(({ rootUri }) => isPathWithin(rootUri.fsPath, appDirectory))
+			.sort((left, right) => right.rootUri.fsPath.length - left.rootUri.fsPath.length);
+		const repository = repositories[0];
+		if (!repository) {
+			return undefined;
+		}
+		const { stdout: remoteOutput } = await execFileAsync('git', ['remote'], { cwd: repository.rootUri.fsPath });
+		const remotes = remoteOutput.split(/\r?\n/).map((remote) => remote.trim()).filter(Boolean);
+		const remoteName = remotes.includes('origin') ? 'origin' : remotes[0];
+		if (!remoteName) {
+			return undefined;
+		}
+		const { stdout: remoteUrl } = await execFileAsync(
+			'git', ['remote', 'get-url', remoteName], { cwd: repository.rootUri.fsPath }
+		);
+		return getGithubOwnerFromRemote(remoteUrl.trim());
+	} catch {
+		return undefined;
+	}
 }
 
 /** @param {string} rootPath @param {ExtensionObject[]} currentObjects */
@@ -1299,10 +1370,27 @@ async function configureGithubRepositoryOwner(
 		const configuration = vscode.workspace.getConfiguration('object-manager');
 		const configuredOwner = configuration.get(REPOSITORY_OWNER_SETTING);
 		const configuredAccountId = configuration.get(REPOSITORY_ACCOUNT_SETTING);
-		const accountChanged = configuredAccountId !== session.account.id;
+		const configuredOwnerSource = configuration.get(REPOSITORY_OWNER_SOURCE_SETTING);
+		const configuredOwnerIsValid = configuredAccountId === session.account.id &&
+			typeof configuredOwner === 'string' && validOwners.includes(configuredOwner);
+		const appManifest = await getAlApplicationManifest();
+		const remoteOwner = appManifest ? await getApplicationRemoteOwner(appManifest) : undefined;
+		const matchingRemoteOwner = validOwners.find((owner) => owner.toLowerCase() === remoteOwner?.toLowerCase());
+
+		if (
+			!showAccountPicker && matchingRemoteOwner &&
+			(!configuredOwnerIsValid || configuredOwnerSource === 'remote' || configuredOwnerSource === 'default')
+		) {
+			await saveRepositoryOwner(matchingRemoteOwner, session.account.id, 'remote');
+			await ensureRangeRepository(
+				matchingRemoteOwner, accountLogin, headers, organizationUsageProvider, debugProvider,
+				rangeDiagnostics, manualRangeUpdate, extensionUsageProvider
+			);
+			return;
+		}
 
 		if (organizations.length === 0) {
-			await saveRepositoryOwner(accountLogin, session.account.id);
+			await saveRepositoryOwner(accountLogin, session.account.id, 'default');
 			await ensureRangeRepository(
 				accountLogin, accountLogin, headers, organizationUsageProvider, debugProvider,
 				rangeDiagnostics, manualRangeUpdate, extensionUsageProvider
@@ -1310,7 +1398,11 @@ async function configureGithubRepositoryOwner(
 			return;
 		}
 
-		if (!showAccountPicker && !accountChanged && typeof configuredOwner === 'string' && validOwners.includes(configuredOwner)) {
+		const staleRemoteOwner = Boolean(
+			remoteOwner && !matchingRemoteOwner &&
+			(configuredOwnerSource === 'remote' || configuredOwnerSource === 'default')
+		);
+		if (!showAccountPicker && configuredOwnerIsValid && !staleRemoteOwner) {
 			await ensureRangeRepository(
 				configuredOwner, accountLogin, headers, organizationUsageProvider, debugProvider,
 				rangeDiagnostics, manualRangeUpdate, extensionUsageProvider
@@ -1335,7 +1427,7 @@ async function configureGithubRepositoryOwner(
 		});
 
 		if (selection) {
-			await saveRepositoryOwner(selection.owner, session.account.id);
+			await saveRepositoryOwner(selection.owner, session.account.id, 'user');
 			await ensureRangeRepository(
 				selection.owner, accountLogin, headers, organizationUsageProvider, debugProvider,
 				rangeDiagnostics, manualRangeUpdate, extensionUsageProvider
@@ -1705,11 +1797,21 @@ async function getGithubJson(url, headers, requestOptions = {}) {
  * @param {string} owner
  * @param {string} accountId
  */
-function saveRepositoryOwner(owner, accountId) {
+function saveRepositoryOwner(owner, accountId, source = 'default') {
 	const configuration = vscode.workspace.getConfiguration('object-manager');
 	return Promise.all([
 		configuration.update(REPOSITORY_OWNER_SETTING, owner, vscode.ConfigurationTarget.Workspace),
-		configuration.update(REPOSITORY_ACCOUNT_SETTING, accountId, vscode.ConfigurationTarget.Workspace)
+		configuration.update(REPOSITORY_ACCOUNT_SETTING, accountId, vscode.ConfigurationTarget.Workspace),
+		configuration.update(REPOSITORY_OWNER_SOURCE_SETTING, source, vscode.ConfigurationTarget.Workspace)
+	]);
+}
+
+function clearRepositoryOwner() {
+	const configuration = vscode.workspace.getConfiguration('object-manager');
+	return Promise.all([
+		configuration.update(REPOSITORY_OWNER_SETTING, '', vscode.ConfigurationTarget.Workspace),
+		configuration.update(REPOSITORY_ACCOUNT_SETTING, '', vscode.ConfigurationTarget.Workspace),
+		configuration.update(REPOSITORY_OWNER_SOURCE_SETTING, '', vscode.ConfigurationTarget.Workspace)
 	]);
 }
 
@@ -1737,6 +1839,7 @@ module.exports = {
 	getObjectValidationFailures,
 	collectRepositoryBranchObjects,
 	analyzeRepositoryBranchObjects,
+	getGithubOwnerFromRemote,
 	syncUnsyncedApplicationObjects,
 	startValidationServer,
 	prepareGitHookInstallation,

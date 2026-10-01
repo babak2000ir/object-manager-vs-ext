@@ -48,6 +48,7 @@
   },
   "settings": {
     "repositoryOwner": "repositoryOwner",
-    "repositoryAccountId": "repositoryAccountId"
+    "repositoryAccountId": "repositoryAccountId",
+    "repositoryOwnerSource": "repositoryOwnerSource"
   }
 }

@@ -27,7 +27,7 @@
       },
       {
         "command": "object-manager.manageAccountPreference",
-        "title": "Object Manager: Manage Account Preference"
+        "title": "Object Manager: Reset GitHub Account and Organization Selection"
       },
       {
         "command": "object-manager.createUpdateApplicationRange",
@@ -113,6 +113,13 @@
           "default": "",
           "scope": "resource",
           "description": "GitHub account associated with the selected repository owner."
+        },
+        "object-manager.repositoryOwnerSource": {
+          "type": "string",
+          "enum": ["", "remote", "user", "default"],
+          "default": "",
+          "scope": "resource",
+          "description": "Whether the repository owner was inferred from the app repository remote or selected by the user."
         },
         "object-manager.repositoryCheckIntervalMinutes": {
           "type": "number",

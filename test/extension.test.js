@@ -25,6 +25,7 @@ const {
 	getApplicationObjectStatuses,
 	getObjectValidationFailures,
 	analyzeRepositoryBranchObjects,
+	getGithubOwnerFromRemote,
 	syncUnsyncedApplicationObjects,
 	startValidationServer,
 	prepareGitHookInstallation,
@@ -40,6 +41,15 @@ suite('Extension Test Suite', () => {
 	test('Sample test', () => {
 		assert.strictEqual(-1, [1, 2, 3].indexOf(5));
 		assert.strictEqual(-1, [1, 2, 3].indexOf(0));
+	});
+
+	test('Finds GitHub owners in common remote URL formats only', () => {
+		assert.strictEqual(getGithubOwnerFromRemote('https://github.com/Contoso/app.git'), 'Contoso');
+		assert.strictEqual(getGithubOwnerFromRemote('git@github.com:Contoso/app.git'), 'Contoso');
+		assert.strictEqual(getGithubOwnerFromRemote('ssh://git@github.com/Contoso/app'), 'Contoso');
+		assert.strictEqual(getGithubOwnerFromRemote('https://gitlab.com/Contoso/app.git'), undefined);
+		assert.strictEqual(getGithubOwnerFromRemote('https://github.com/Contoso/app/extra'), undefined);
+		assert.strictEqual(getGithubOwnerFromRemote('not a remote URL'), undefined);
 	});
 
 	test('Activates and disposes features from lifecycle triggers', async () => {

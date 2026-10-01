@@ -1,10 +1,27 @@
+efficiency check with AI: general improvemtn also in bursts and mutlipe file changings. Queue and run abit later, maybe do it always.
+checkuser friendlyness and usecases check, specially aganist generla highl vel usage.
+settings consolidation in settings.json with prefix, specially debug flag for showing debug info in side panels
+Global pre-sync info just to stop users even before finishing the development
+in local scanning, make sure you fetch have every remore branch checked
+seperate branches to main,master,dev,develop and rest to enforce conflict or just report it to user.
+make the localserver/global error or just vscode errro on conflict a user choice through settings.
+when global architecture settled, manage renumbered, dleted objects as well.
+open conflict url in repo, locally etc.
+filter all branches download, global actions check with date (newer than a month) 
+other providers for remote git repo
+
+--Architecture
+Verification: the VS Code test suite passes, 22 tests. npm test is currently blocked in its lint pretest because ESLint scans .vscode-test and loads the installed AL extension’s config, which cannot find @eslint/js; scope linting to this project’s files or exclude .vscode-test.
+seperation of concerns and remove duplication of code, improve reusability (or maintainability, keep the existing pure object-model layer, but move Git snapshot collection, GitHub reservation storage, and orchestration out of the large extension.js into separate modules with testable interfaces.) or make it easier to maintain in future. 
+
+
+--documentation
+The README is still the VS Code starter template, so it should document the guarantee boundaries, setup, hook behavior, and conflict-resolution workflow.
+Documentation (for vs code startup)
 make a nice menaingful README.MD and a version inside it and nice mechnaism for object manager extension to update it.
+
+
+--done not tested
 >>handle app.json.id changes
 >>full sync checking other branches and reserve everything in management repo
-efficiency check with AI: general improvemtn also in bursts and mutlipe file changings. Queue and run abit later, maybe do it always.
-Architecture is good? Anything missing, make it better, make it easier to maintain in future. 
-checkuser friendlyness and usecases check, specially aganist generla highl vel usage.
-Documentation.
-action to refresh app: Extension Usage
-settings consolidation in settings.json with prefix, specially debug flag for showing debug info in side panels
-repo login/selection simplification
+>>repo login/selection simplification
