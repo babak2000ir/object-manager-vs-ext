@@ -54,6 +54,10 @@
         "icon": "$(loading~spin)"
       },
       {
+        "command": "object-manager.syncRepositoryObjects",
+        "title": "Object Manager: Sync Existing Repository Objects"
+      },
+      {
         "command": "object-manager.installGitValidationHooks",
         "title": "Object Manager: Install Git Validation Hooks"
       },

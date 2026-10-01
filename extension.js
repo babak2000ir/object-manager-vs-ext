@@ -14,6 +14,7 @@ const {
 	getNextAvailableObjectId,
 	getObjectIdSlot,
 	getDuplicateObjectKeys,
+	getExtensionObjectKey,
 	areRangesEqual,
 	normalizeObjectFilename,
 	classifyObjectSyncStatus
@@ -411,6 +412,123 @@ function startFeatures(featureDisposables) {
 		'object-manager.syncObjectReservationBusy',
 		() => undefined
 	);
+	const syncRepositoryObjects = vscode.commands.registerCommand(
+		'object-manager.syncRepositoryObjects',
+		async () => {
+			try {
+				const appManifest = await getAlApplicationManifest();
+				if (!appManifest || !Array.isArray(appManifest.manifest.idRanges)) {
+					vscode.window.showErrorMessage(`Unable to sync repository objects because ${EXTENSION_CONFIG.workspace.appManifestFileName} has no valid idRanges.`);
+					return;
+				}
+				const gitRepositories = await getGitRepositories();
+				const matchingRepositories = gitRepositories.filter(({ rootUri }) =>
+					isPathWithin(rootUri.fsPath, path.dirname(appManifest.uri.fsPath))
+				);
+				if (matchingRepositories.length === 0) {
+					vscode.window.showInformationMessage('Open this AL workspace inside a Git repository before syncing its objects.');
+					return;
+				}
+				let repository = matchingRepositories[0];
+				if (matchingRepositories.length > 1) {
+					const selection = await vscode.window.showQuickPick(matchingRepositories.map((item) => ({
+						label: item.rootUri.fsPath,
+						repository: item
+					})), { placeHolder: 'Select the Git repository to sync' });
+					if (!selection) {
+						return;
+					}
+					repository = selection.repository;
+				}
+				const branchData = await collectRepositoryBranchObjects(
+					repository.rootUri.fsPath,
+					await collectExtensionObjects(true)
+				);
+				const analysis = analyzeRepositoryBranchObjects(branchData, appManifest.manifest.idRanges);
+				const currentBranch = branchData.find(({ isCurrent }) => isCurrent);
+				extensionUsageProvider.setObjects(currentBranch?.objects || [], appManifest.manifest.idRanges);
+				const currentConflicts = analysis.conflicts.filter(({ branch }) => branch === currentBranch?.name);
+				if (currentConflicts.length > 0) {
+					const action = 'Open Extension Usage';
+					const selection = await vscode.window.showErrorMessage(
+						`Sync stopped. Fix current-branch object conflicts in Extension Usage: ${formatBranchConflicts(currentConflicts)}`,
+						action
+					);
+					if (selection === action) {
+						await vscode.commands.executeCommand('object-manager.extensionUsage.focus');
+					}
+					return;
+				}
+				const session = await selectGithubAccount();
+				if (!session) {
+					throw new Error('Sign in to GitHub before syncing repository objects.');
+				}
+				const configuration = vscode.workspace.getConfiguration('object-manager');
+				const owner = configuration.get(REPOSITORY_OWNER_SETTING);
+				const accountId = configuration.get(REPOSITORY_ACCOUNT_SETTING);
+				if (typeof owner !== 'string' || !owner || accountId !== session.account.id) {
+					vscode.window.showInformationMessage('Choose the repository owner before syncing repository objects.');
+					await refreshRepositoryState(true);
+					return;
+				}
+				const repositoryUrl = `${GITHUB_API_URL}/repos/${encodeURIComponent(owner)}/${RANGE_REPOSITORY_NAME}`;
+				const headers = getGithubHeaders(session);
+				const statuses = await getApplicationObjectStatuses(repositoryUrl, analysis.objects, appManifest.manifest.idRanges, headers);
+				extensionUsageProvider.setSyncStatuses(statuses);
+				const currentObjectKeys = new Set((currentBranch?.objects || []).map(getObjectKey));
+				const repositoryConflicts = statuses
+					.filter(({ object, status }) => currentObjectKeys.has(getObjectKey(object)) && (status === 'conflict' || status === 'outOfRange'))
+					.map(({ object, status }) => ({
+						branch: currentBranch?.name || 'current branch',
+						object,
+						reason: /** @type {'conflict' | 'outOfRange'} */ (status)
+					}));
+				if (repositoryConflicts.length > 0) {
+					const action = 'Open Extension Usage';
+					const selection = await vscode.window.showErrorMessage(
+						`Sync stopped. Fix current-branch object conflicts in Extension Usage: ${formatBranchConflicts(repositoryConflicts)}`,
+						action
+					);
+					if (selection === action) {
+						await vscode.commands.executeCommand('object-manager.extensionUsage.focus');
+					}
+					return;
+				}
+				const writableStatuses = statuses.filter(({ object, status }) =>
+					analysis.syncableObjectKeys.has(getObjectKey(object)) && status !== 'conflict' && status !== 'outOfRange'
+				);
+				let synced = 0;
+				let failed = 0;
+				for (const { object } of writableStatuses) {
+					try {
+						const status = await upsertApplicationObjectReservation(repositoryUrl, object, appManifest.manifest.idRanges, headers);
+						extensionUsageProvider.setObjectSyncStatus(object, status);
+						if (status === 'synced') {
+							synced++;
+						} else {
+							failed++;
+						}
+					} catch {
+						extensionUsageProvider.setObjectSyncStatus(object, 'unavailable');
+						failed++;
+					}
+				}
+				const otherBranchConflicts = analysis.conflicts.filter(({ branch }) => branch !== currentBranch?.name);
+				if (otherBranchConflicts.length > 0) {
+					vscode.window.showInformationMessage(
+						`Synced ${synced} object${synced === 1 ? '' : 's'}. Conflicts in other branches: ${formatBranchConflicts(otherBranchConflicts)}`
+					);
+				} else if (failed > 0) {
+					vscode.window.showErrorMessage(`Synced ${synced} objects; ${failed} could not be synced. See Extension Usage.`);
+				} else {
+					vscode.window.showInformationMessage(`Synced ${synced} object${synced === 1 ? '' : 's'} from the repository branches.`);
+				}
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				vscode.window.showErrorMessage(`Unable to sync repository objects: ${message}`);
+			}
+		}
+	);
 	const suggestAvailableObjectId = vscode.commands.registerCommand(
 		'object-manager.suggestAvailableObjectId',
 		async () => {
@@ -482,6 +600,7 @@ function startFeatures(featureDisposables) {
 		forceApplicationRangeToRepositoryBusy,
 		syncObjectReservation,
 		syncObjectReservationBusy,
+		syncRepositoryObjects,
 		suggestAvailableObjectId,
 		installGitValidationHooks,
 		removeGitValidationHooks,
@@ -503,6 +622,7 @@ function startFeatures(featureDisposables) {
 			{ label: 'Object Manager: Manage Account Preference', command: 'object-manager.manageAccountPreference' },
 			{ label: 'Object Manager: Create or Update Application Range', command: 'object-manager.createUpdateApplicationRange' },
 			{ label: 'Object Manager: Sync Object Reservation', command: 'object-manager.syncObjectReservation' },
+			{ label: 'Object Manager: Sync Existing Repository Objects', command: 'object-manager.syncRepositoryObjects' },
 			{ label: 'Object Manager: Install Git Validation Hooks', command: 'object-manager.installGitValidationHooks' },
 			{ label: 'Object Manager: Remove Git Validation Hooks', command: 'object-manager.removeGitValidationHooks' }
 		])),
@@ -693,6 +813,115 @@ async function getGitApi() {
 
 async function getGitRepositories() {
 	return (await getGitApi()).repositories;
+}
+
+/** @param {string} parentPath @param {string} childPath */
+function isPathWithin(parentPath, childPath) {
+	const relativePath = path.relative(parentPath, childPath);
+	return relativePath === '' || (!relativePath.startsWith(`..${path.sep}`) && relativePath !== '..' && !path.isAbsolute(relativePath));
+}
+
+/** @param {string} rootPath @param {ExtensionObject[]} currentObjects */
+async function collectRepositoryBranchObjects(rootPath, currentObjects) {
+	const { stdout: currentBranchOutput } = await execFileAsync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: rootPath });
+	const currentBranchName = currentBranchOutput.trim();
+	if (!currentBranchName || currentBranchName === 'HEAD') {
+		throw new Error('Check out a branch before syncing repository objects.');
+	}
+	const { stdout: branchOutput } = await execFileAsync(
+		'git', ['for-each-ref', '--format=%(refname:short)', 'refs/heads', 'refs/remotes'], { cwd: rootPath }
+	);
+	const branchNames = [...new Set([
+		currentBranchName,
+		...branchOutput.split(/\r?\n/).map((branch) => branch.trim()).filter((branch) => branch && !branch.endsWith('/HEAD'))
+	])];
+	return Promise.all(branchNames.map(async (branch) => {
+		if (branch === currentBranchName) {
+			return { name: branch, isCurrent: true, objects: currentObjects };
+		}
+		const { stdout: fileOutput } = await execFileAsync(
+			'git', ['ls-tree', '-r', '-z', '--name-only', branch, '--', '*.al'],
+			{ cwd: rootPath, maxBuffer: 50 * 1024 * 1024 }
+		);
+		const files = fileOutput.split('\0').filter(Boolean);
+		const objects = [];
+		for (const file of files) {
+			const { stdout: source } = await execFileAsync(
+				'git', ['show', `${branch}:${file}`], { cwd: rootPath, maxBuffer: 50 * 1024 * 1024 }
+			);
+			objects.push(...parseAlObjects(source));
+		}
+		return { name: branch, isCurrent: false, objects };
+	}));
+}
+
+/** @param {Array<{ name: string, isCurrent: boolean, objects: ExtensionObject[] }>} branches @param {unknown} ranges */
+function analyzeRepositoryBranchObjects(branches, ranges) {
+	/** @type {Array<{ branch: string, object: ExtensionObject, reason: 'conflict' | 'outOfRange' }>} */
+	const conflicts = [];
+	const currentBranch = branches.find(({ isCurrent }) => isCurrent);
+	const currentNames = new Map((currentBranch?.objects || []).map((object) => [getExtensionObjectKey(object), object['object name']]));
+	/** @type {Map<string, Array<{ branch: string, object: ExtensionObject }>>} */
+	const objectsByKey = new Map();
+	for (const { name, objects } of branches) {
+		const duplicates = getDuplicateObjectKeys(objects);
+		for (const object of objects) {
+			const key = getExtensionObjectKey(object);
+			const entries = objectsByKey.get(key) || [];
+			entries.push({ branch: name, object });
+			objectsByKey.set(key, entries);
+			if (!isObjectIdInRanges(object['object id'], ranges)) {
+				conflicts.push({ branch: name, object, reason: 'outOfRange' });
+			} else if (duplicates.has(key)) {
+				conflicts.push({ branch: name, object, reason: 'conflict' });
+			}
+		}
+	}
+	for (const entries of objectsByKey.values()) {
+		const names = new Set(entries.map(({ object }) => object['object name']));
+		if (names.size < 2) {
+			continue;
+		}
+		const currentName = currentNames.get(getExtensionObjectKey(entries[0].object));
+		for (const entry of entries) {
+			if (entry.object['object name'] !== currentName) {
+				conflicts.push({ ...entry, reason: 'conflict' });
+			}
+		}
+	}
+	const syncableObjectKeys = new Set();
+	const syncObjects = [];
+	for (const [key, entries] of objectsByKey) {
+		const inRangeEntries = entries.filter(({ object }) => isObjectIdInRanges(object['object id'], ranges));
+		if (inRangeEntries.length === 0) {
+			continue;
+		}
+		const names = new Set(inRangeEntries.map(({ object }) => object['object name']));
+		const selected = currentBranch
+			? inRangeEntries.find(({ branch }) => branch === currentBranch.name)
+			: undefined;
+		if (names.size > 1 && !selected) {
+			continue;
+		}
+		const object = selected?.object || inRangeEntries[0].object;
+		syncableObjectKeys.add(key);
+		syncObjects.push(object);
+	}
+	return { conflicts, objects: syncObjects, syncableObjectKeys };
+}
+
+/** @param {Array<{ branch: string, object: ExtensionObject, reason: 'conflict' | 'outOfRange' }>} conflicts */
+function formatBranchConflicts(conflicts) {
+	const uniqueConflicts = new Map(conflicts.map(({ branch, object, reason }) => [
+		`${branch}:${getExtensionObjectKey(object)}:${object['object name']}:${reason}`,
+		`${branch}: ${object['object type']} ${object['object id']} ${object['object name']} (${reason === 'outOfRange' ? 'out of range' : 'different names use the same ID'})`
+	]));
+	return [...uniqueConflicts.values()].join('; ');
+}
+
+/** @param {ExtensionObject} object */
+function getObjectKey(object) {
+	return getExtensionObjectKey(object);
 }
 
 /** @param {{ rootUri: vscode.Uri }} repository */
@@ -912,6 +1141,64 @@ async function checkAndUploadApplicationObject(repositoryUrl, object, ranges, he
 			throw new Error(`GitHub returned an invalid ${folderPath} directory listing.`);
 		}
 		return await getReservationFileStatus(latestContents, object, ranges, headers) || 'conflict';
+	}
+	if (!response.ok) {
+		throw new Error(await getGithubResponseError(response));
+	}
+	return 'synced';
+}
+
+/** @param {string} repositoryUrl @param {ExtensionObject} object @param {unknown} ranges @param {GitHubApiHeaders} headers */
+async function upsertApplicationObjectReservation(repositoryUrl, object, ranges, headers) {
+	if (!isObjectIdInRanges(object['object id'], ranges)) {
+		return 'outOfRange';
+	}
+	const objectType = object['object type'].toLowerCase();
+	const folderPath = `${OBJECT_RESERVATION_DIRECTORY}/${encodeURIComponent(objectType)}`;
+	const folderContents = await getObjectTypeFolderContents(repositoryUrl, objectType, headers);
+	const expectedName = normalizeObjectFilename(`${objectType}${object['object id']}`);
+	const matchingFiles = folderContents.filter((entry) => {
+		const file = /** @type {{ type?: unknown, name?: unknown }} */ (entry);
+		return file && file.type === 'file' && typeof file.name === 'string' && normalizeObjectFilename(file.name) === expectedName;
+	});
+	if (matchingFiles.length === 0) {
+		return checkAndUploadApplicationObject(repositoryUrl, object, ranges, headers);
+	}
+	if (matchingFiles.length > 1) {
+		return 'conflict';
+	}
+	const existing = /** @type {{ url?: unknown, name?: unknown }} */ (matchingFiles[0]);
+	if (typeof existing.url !== 'string' || typeof existing.name !== 'string') {
+		return 'conflict';
+	}
+	const existingFile = /** @type {GitHubContentsFile} */ (await getGithubJson(existing.url, headers));
+	const existingContent = Buffer.from(existingFile.content.replace(/\s/g, ''), 'base64').toString('utf8');
+	let existingRecord;
+	try {
+		existingRecord = JSON.parse(existingContent);
+	} catch {
+		return 'conflict';
+	}
+	if (classifyObjectSyncStatus(object, ranges, existingRecord) !== 'synced' || typeof existingFile.sha !== 'string') {
+		return 'conflict';
+	}
+	const filePath = `${folderPath}/${encodeURIComponent(existing.name)}`;
+	const response = await fetch(`${repositoryUrl}/contents/${filePath}`, {
+		method: 'PUT',
+		headers,
+		body: JSON.stringify({
+			message: `Update reservation for ${object['object type']} ${object['object id']}`,
+			content: Buffer.from(JSON.stringify({
+				name: object['object name'],
+				timestamp: new Date().toISOString(),
+				repo: repositoryUrl
+			}, null, 4)).toString('base64'),
+			sha: existingFile.sha,
+			branch: RANGE_BRANCH
+		})
+	});
+	if (response.status === 409 || response.status === 422) {
+		return 'conflict';
 	}
 	if (!response.ok) {
 		throw new Error(await getGithubResponseError(response));
@@ -1448,9 +1735,12 @@ module.exports = {
 	classifyObjectSyncStatus,
 	getApplicationObjectStatuses,
 	getObjectValidationFailures,
+	collectRepositoryBranchObjects,
+	analyzeRepositoryBranchObjects,
 	syncUnsyncedApplicationObjects,
 	startValidationServer,
 	prepareGitHookInstallation,
 	installGitValidationHooksForRepository,
-	checkAndUploadApplicationObject
+	checkAndUploadApplicationObject,
+	upsertApplicationObjectReservation
 }

@@ -24,11 +24,13 @@ const {
 	classifyObjectSyncStatus,
 	getApplicationObjectStatuses,
 	getObjectValidationFailures,
+	analyzeRepositoryBranchObjects,
 	syncUnsyncedApplicationObjects,
 	startValidationServer,
 	prepareGitHookInstallation,
 	installGitValidationHooksForRepository,
 	checkAndUploadApplicationObject,
+	upsertApplicationObjectReservation,
 	forceApplicationRangeToRepositoryData
 } = require('../extension');
 
@@ -377,6 +379,74 @@ query 50105 CustomerQuery {}`;
 			getObjectValidationFailures(statuses).map(({ status }) => status),
 			['conflict', 'outOfRange']
 		);
+	});
+
+	test('Reports conflicts on other branches and syncs the current-branch object version', () => {
+		const currentObject = { 'object type': 'Page', 'object name': 'CustomerCard', 'object id': '50010' };
+		const branches = [
+			{ name: 'main', isCurrent: true, objects: [currentObject] },
+			{ name: 'feature/rename', isCurrent: false, objects: [
+				{ ...currentObject, 'object name': 'CustomerList' },
+				{ 'object type': 'Table', 'object name': 'OutsideRange', 'object id': '60000' },
+				{ 'object type': 'Report', 'object name': 'SalesReport', 'object id': '50011' }
+			] }
+		];
+
+		const analysis = analyzeRepositoryBranchObjects(branches, [{ from: 50000, to: 50099 }]);
+
+		assert.deepStrictEqual(analysis.conflicts.map(({ branch, object, reason }) => [
+			branch, object['object id'], reason
+		]), [
+			['feature/rename', '60000', 'outOfRange'],
+			['feature/rename', '50010', 'conflict']
+		]);
+		assert.deepStrictEqual(analysis.objects, [
+			currentObject,
+			{ 'object type': 'Report', 'object name': 'SalesReport', 'object id': '50011' }
+		]);
+		assert.strictEqual(analysis.syncableObjectKeys.has('Page:50010'), true);
+	});
+
+	test('Updates a same-name reservation file with its current SHA', async () => {
+		const originalFetch = global.fetch;
+		const repositoryUrl = `${EXTENSION_CONFIG.github.apiUrl}/repos/example/${EXTENSION_CONFIG.rangeRepository.name}`;
+		const object = { 'object type': 'Page', 'object name': 'CustomerCard', 'object id': '50010' };
+		/** @type {{ url: string, options: RequestInit }[]} */
+		const requests = [];
+		try {
+			global.fetch = async (url, options = {}) => {
+				requests.push({ url: String(url), options });
+				if (options.method === 'PUT') {
+					return new Response('{}', { status: 200 });
+				}
+				if (String(url).includes('?ref=')) {
+					return new Response(JSON.stringify([{
+						type: 'file',
+						name: 'Page50010.json',
+						url: `${repositoryUrl}/contents/${EXTENSION_CONFIG.rangeRepository.objectReservationsDirectory}/page/Page50010.json`
+					}]), { status: 200 });
+				}
+				return new Response(JSON.stringify({
+					sha: 'current-sha',
+					content: Buffer.from(JSON.stringify({ name: 'CustomerCard' })).toString('base64')
+				}), { status: 200 });
+			};
+
+			assert.strictEqual(await upsertApplicationObjectReservation(
+				repositoryUrl,
+				object,
+				[{ from: 50000, to: 50099 }],
+				{}
+			), 'synced');
+			assert.strictEqual(requests.length, 3);
+			const update = JSON.parse(String(requests[2].options.body));
+			assert.ok(requests[2].url.endsWith('/page/Page50010.json'));
+			assert.strictEqual(update.sha, 'current-sha');
+			assert.strictEqual(update.branch, EXTENSION_CONFIG.rangeRepository.branch);
+			assert.strictEqual(JSON.parse(Buffer.from(update.content, 'base64').toString('utf8')).name, 'CustomerCard');
+		} finally {
+			global.fetch = originalFetch;
+		}
 	});
 
 	test('Requires authorization and blocks Git hooks when validation fails', async () => {

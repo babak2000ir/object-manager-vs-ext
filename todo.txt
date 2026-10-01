@@ -1,8 +1,10 @@
 make a nice menaingful README.MD and a version inside it and nice mechnaism for object manager extension to update it.
 >>handle app.json.id changes
-full sync checking other branches and reserve everything in management repo
+>>full sync checking other branches and reserve everything in management repo
 efficiency check with AI: general improvemtn also in bursts and mutlipe file changings. Queue and run abit later, maybe do it always.
 Architecture is good? Anything missing, make it better, make it easier to maintain in future. 
 checkuser friendlyness and usecases check, specially aganist generla highl vel usage.
 Documentation.
 action to refresh app: Extension Usage
+settings consolidation in settings.json with prefix, specially debug flag for showing debug info in side panels
+repo login/selection simplification
