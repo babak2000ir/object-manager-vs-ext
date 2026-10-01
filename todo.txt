@@ -12,7 +12,6 @@ other providers for remote git repo
 
 --Architecture
 Verification: the VS Code test suite passes, 22 tests. npm test is currently blocked in its lint pretest because ESLint scans .vscode-test and loads the installed AL extension’s config, which cannot find @eslint/js; scope linting to this project’s files or exclude .vscode-test.
-seperation of concerns and remove duplication of code, improve reusability (or maintainability, keep the existing pure object-model layer, but move Git snapshot collection, GitHub reservation storage, and orchestration out of the large extension.js into separate modules with testable interfaces.) or make it easier to maintain in future. 
 
 
 --documentation

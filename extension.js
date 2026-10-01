@@ -1,10 +1,7 @@
 // The module 'vscode' contains the VS Code extensibility API
 // Import the module and reference it with the alias vscode in your code below
 const vscode = require('vscode');
-const crypto = require('crypto');
 const EXTENSION_CONFIG = require('./config.json');
-const fs = require('fs/promises');
-const http = require('http');
 const path = require('path');
 const { execFile } = require('child_process');
 const { promisify } = require('util');
@@ -16,10 +13,20 @@ const {
 	getDuplicateObjectKeys,
 	getExtensionObjectKey,
 	areRangesEqual,
-	normalizeObjectFilename,
 	classifyObjectSyncStatus
 } = require('./object-model');
 const { activateOnTriggers } = require('./feature-lifecycle');
+const { createGithubReservationStore } = require('./github-reservations');
+const { createGithubRangeRepository } = require('./github-range-repository');
+const { createObjectSyncService } = require('./object-sync');
+const { createGitValidationTools } = require('./git-validation');
+const {
+	createGitSnapshotCollector,
+	getGithubOwnerFromRemote,
+	isPathWithin,
+	analyzeRepositoryBranchObjects,
+	formatBranchConflicts
+} = require('./git-snapshots');
 const {
 	TreeDataProvider,
 	ExtensionUsageDataProvider,
@@ -41,18 +48,24 @@ const REPOSITORY_ACCOUNT_SETTING = EXTENSION_CONFIG.settings.repositoryAccountId
 const REPOSITORY_OWNER_SOURCE_SETTING = EXTENSION_CONFIG.settings.repositoryOwnerSource;
 const APP_ID_PATTERN = new RegExp(EXTENSION_CONFIG.workspace.appIdPattern, 'i');
 const execFileAsync = promisify(execFile);
-const GIT_HOOKS = ['pre-commit', 'pre-push'];
-const GIT_HOOK_MARKER = 'object-manager-validation-hook';
-const promptedRangeMismatches = new Set();
 let disposeActiveFeatures = () => {};
+const gitValidationTools = createGitValidationTools({
+	execFileAsync,
+	fileSystem: require('fs/promises'),
+	hookSourcePath: path.join(__dirname, 'git-validation-hook.js'),
+	hookNames: ['pre-commit', 'pre-push'],
+	marker: 'object-manager-validation-hook'
+});
+const {
+	startValidationServer,
+	prepareGitHookInstallation,
+	installGitValidationHooksForRepository,
+	removeGitValidationHooksForRepository
+} = gitValidationTools;
 
 /** @typedef {{ login: string }} GitHubUser */
 /** @typedef {{ login: string }} GitHubOrganization */
-/** @typedef {{ default_branch: string }} GitHubRepository */
-/** @typedef {{ content: string, sha: string }} GitHubContentsFile */
-/** @typedef {{ object: { sha: string } }} GitHubReference */
 /** @typedef {{ id: string, name: string, publisher: string, ranges: Array<{ from: number, to: number }> }} RangeRegistration */
-/** @typedef {{ Remarks: string[], ranges: RangeRegistration[] }} RangeData */
 /** @typedef {{ rangeOwner?: string, applicationId?: string }} ApplicationRangeTreeItem */
 /** @typedef {{ 'object type': string, 'object name': string, 'object id': string }} ExtensionObject */
 /** @typedef {'outOfRange' | 'conflict' | 'synced' | 'unsynced' | 'checking' | 'unavailable'} ObjectSyncStatus */
@@ -63,12 +76,79 @@ let disposeActiveFeatures = () => {};
 /** @typedef {{ url: string, token: string, dispose: () => void }} GitValidationServer */
 /** @typedef {{ label: string, description?: string, isSelected?: boolean, syncStatus?: ObjectSyncStatus, contextValue?: string, object?: ExtensionUsageEntry, command?: string, children?: DebugTreeItem[], rangeOwner?: string, applicationId?: string }} DebugTreeItem */
 
-// This method is called when your extension is activated
-// Your extension is activated the very first time the command is executed
+const githubReservationStore = createGithubReservationStore({
+	reservationDirectory: OBJECT_RESERVATION_DIRECTORY,
+	branch: RANGE_BRANCH,
+	getGithubJson,
+	getGithubResponseError
+});
+const {
+	getApplicationObjectStatuses,
+	checkAndUploadApplicationObject,
+	upsertApplicationObjectReservation
+} = githubReservationStore;
+const gitSnapshotCollector = createGitSnapshotCollector({
+	findFiles: (pattern) => Promise.resolve(vscode.workspace.findFiles(pattern)),
+	readFile: (file) => Promise.resolve(vscode.workspace.fs.readFile(file)),
+	execFileAsync,
+	getGitRepositories,
+	sourcePattern: EXTENSION_CONFIG.workspace.alSourcePattern,
+	parseAlObjects
+});
+const {
+	collectExtensionObjects,
+	getApplicationRemoteOwner,
+	collectRepositoryBranchObjects
+} = gitSnapshotCollector;
+const objectSyncService = createObjectSyncService({
+	getApplicationManifest: getAlApplicationManifest,
+	collectExtensionObjects,
+	getGithubSession: (silent) => Promise.resolve(vscode.authentication.getSession(
+		GITHUB_AUTH_PROVIDER,
+		GITHUB_AUTH_SCOPES,
+		{ silent }
+	)),
+	getRepositorySelection: () => {
+		const configuration = vscode.workspace.getConfiguration('object-manager');
+		return {
+			owner: configuration.get(REPOSITORY_OWNER_SETTING),
+			accountId: configuration.get(REPOSITORY_ACCOUNT_SETTING)
+		};
+	},
+	getRepositoryUrl: (owner) => `${GITHUB_API_URL}/repos/${encodeURIComponent(owner)}/${RANGE_REPOSITORY_NAME}`,
+	getGithubHeaders,
+	getApplicationObjectStatuses,
+	checkAndUploadApplicationObject,
+	appManifestFileName: EXTENSION_CONFIG.workspace.appManifestFileName,
+	showErrorMessage: (message) => vscode.window.showErrorMessage(message),
+	showInformationMessage: (message) => vscode.window.showInformationMessage(message)
+});
+const {
+	validateWorkspaceObjects,
+	syncUnsyncedWorkspaceObjects,
+	syncUnsyncedApplicationObjects,
+	getObjectValidationFailures
+} = objectSyncService;
+const githubRangeRepository = createGithubRangeRepository({
+	vscode,
+	apiUrl: GITHUB_API_URL,
+	repositoryName: RANGE_REPOSITORY_NAME,
+	fileName: RANGE_FILE_NAME,
+	branch: RANGE_BRANCH,
+	initialData: INITIAL_RANGE_DATA,
+	getGithubJson,
+	getGithubResponseError,
+	getApplicationManifest: getAlApplicationManifest,
+	collectExtensionObjects,
+	getApplicationObjectStatuses
+});
+const {
+	ensureRangeRepository: ensureGithubRangeRepository,
+	forceApplicationRangeToRepositoryData: forceGithubApplicationRangeToRepositoryData,
+	createApplicationRegistration: createGithubApplicationRegistration
+} = githubRangeRepository;
 
-/**
- * @param {vscode.ExtensionContext} context
- */
+/** @param {vscode.ExtensionContext} context */
 function activate(context) {
 	/** @type {vscode.Disposable[]} */
 	const featureDisposables = [];
@@ -341,8 +421,8 @@ function startFeatures(featureDisposables) {
 					return;
 				}
 
-				const registration = createApplicationRegistration(appManifest.manifest);
-				const changed = await forceApplicationRangeToRepositoryData(
+				const registration = createGithubApplicationRegistration(appManifest.manifest);
+				const changed = await forceGithubApplicationRangeToRepositoryData(
 					owner,
 					registration,
 					getGithubHeaders(session)
@@ -488,9 +568,9 @@ function startFeatures(featureDisposables) {
 				const headers = getGithubHeaders(session);
 				const statuses = await getApplicationObjectStatuses(repositoryUrl, analysis.objects, appManifest.manifest.idRanges, headers);
 				extensionUsageProvider.setSyncStatuses(statuses);
-				const currentObjectKeys = new Set((currentBranch?.objects || []).map(getObjectKey));
+				const currentObjectKeys = new Set((currentBranch?.objects || []).map(getExtensionObjectKey));
 				const repositoryConflicts = statuses
-					.filter(({ object, status }) => currentObjectKeys.has(getObjectKey(object)) && (status === 'conflict' || status === 'outOfRange'))
+					.filter(({ object, status }) => currentObjectKeys.has(getExtensionObjectKey(object)) && (status === 'conflict' || status === 'outOfRange'))
 					.map(({ object, status }) => ({
 						branch: currentBranch?.name || 'current branch',
 						object,
@@ -508,7 +588,7 @@ function startFeatures(featureDisposables) {
 					return;
 				}
 				const writableStatuses = statuses.filter(({ object, status }) =>
-					analysis.syncableObjectKeys.has(getObjectKey(object)) && status !== 'conflict' && status !== 'outOfRange'
+					analysis.syncableObjectKeys.has(getExtensionObjectKey(object)) && status !== 'conflict' && status !== 'outOfRange'
 				);
 				let synced = 0;
 				let failed = 0;
@@ -645,172 +725,6 @@ function startFeatures(featureDisposables) {
 	);
 }
 
-/** @param {() => Promise<{ ok: boolean, message?: string }>} validate */
-function startValidationServer(validate) {
-	const token = crypto.randomBytes(32).toString('hex');
-	const server = http.createServer(async (request, response) => {
-		if (request.method !== 'POST' || request.url !== '/validate') {
-			response.writeHead(404).end();
-			return;
-		}
-		if (request.headers.authorization !== `Bearer ${token}`) {
-			response.writeHead(403).end();
-			return;
-		}
-		try {
-			const result = await validate();
-			response.writeHead(result.ok ? 200 : 409, { 'Content-Type': 'application/json' });
-			response.end(JSON.stringify(result));
-		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
-			response.writeHead(503, { 'Content-Type': 'application/json' });
-			response.end(JSON.stringify({ ok: false, message }));
-		}
-	});
-	return new Promise((resolve, reject) => {
-		server.once('error', reject);
-		server.listen(0, '127.0.0.1', () => {
-			const address = server.address();
-			if (!address || typeof address === 'string') {
-				server.close();
-				reject(new Error('Unable to start the local object validation server.'));
-				return;
-			}
-			resolve({
-				url: `http://127.0.0.1:${address.port}/validate`,
-				token,
-				dispose: () => server.close()
-			});
-		});
-	});
-}
-
-/** @param {ExtensionUsageDataProvider} extensionUsageProvider */
-async function validateWorkspaceObjects(extensionUsageProvider) {
-	const appManifest = await getAlApplicationManifest();
-	if (!appManifest || !Array.isArray(appManifest.manifest.idRanges)) {
-		throw new Error(`Unable to check objects because ${EXTENSION_CONFIG.workspace.appManifestFileName} has no valid idRanges.`);
-	}
-	const objects = await collectExtensionObjects(true);
-	extensionUsageProvider.setObjects(objects, appManifest.manifest.idRanges);
-	if (objects.length === 0) {
-		return { ok: true };
-	}
-	const session = await vscode.authentication.getSession(GITHUB_AUTH_PROVIDER, GITHUB_AUTH_SCOPES, { silent: true });
-	if (!session) {
-		extensionUsageProvider.setSyncUnavailable('Sign in to GitHub to validate object reservations before committing or pushing.');
-		throw new Error('Sign in to GitHub to validate object reservations before committing or pushing.');
-	}
-	const configuration = vscode.workspace.getConfiguration('object-manager');
-	const owner = configuration.get(REPOSITORY_OWNER_SETTING);
-	const accountId = configuration.get(REPOSITORY_ACCOUNT_SETTING);
-	if (typeof owner !== 'string' || !owner || accountId !== session.account.id) {
-		extensionUsageProvider.setSyncUnavailable('Choose the GitHub repository owner before validating object reservations.');
-		throw new Error('Choose the GitHub repository owner for object validation before committing or pushing.');
-	}
-	const repositoryUrl = `${GITHUB_API_URL}/repos/${encodeURIComponent(owner)}/${RANGE_REPOSITORY_NAME}`;
-	let statuses;
-	try {
-		statuses = await getApplicationObjectStatuses(
-			repositoryUrl,
-			objects,
-			appManifest.manifest.idRanges,
-			getGithubHeaders(session)
-		);
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		extensionUsageProvider.setSyncUnavailable(message);
-		throw error;
-	}
-	extensionUsageProvider.setSyncStatuses(statuses);
-	const failures = getObjectValidationFailures(statuses);
-	if (failures.length > 0) {
-		const details = failures.map(({ object, status }) =>
-			`${object['object type']} ${object['object name']} (${object['object id']}): ${status === 'conflict' ? 'reservation conflict' : 'ID is out of range'}`
-		).join('; ');
-		vscode.window.showErrorMessage(`Git operation blocked. Refresh object data and resolve: ${details}`);
-		return { ok: false, message: `Resolve object validation errors: ${details}` };
-	}
-	return { ok: true };
-}
-
-/** @param {ExtensionUsageDataProvider} extensionUsageProvider */
-async function syncUnsyncedWorkspaceObjects(extensionUsageProvider) {
-	const appManifest = await getAlApplicationManifest();
-	if (!appManifest || !Array.isArray(appManifest.manifest.idRanges)) {
-		throw new Error(`Unable to sync objects because ${EXTENSION_CONFIG.workspace.appManifestFileName} has no valid idRanges.`);
-	}
-	const objects = await collectExtensionObjects(true);
-	extensionUsageProvider.setObjects(objects, appManifest.manifest.idRanges);
-	if (objects.length === 0) {
-		return 0;
-	}
-	const session = await vscode.authentication.getSession(GITHUB_AUTH_PROVIDER, GITHUB_AUTH_SCOPES, { silent: true });
-	if (!session) {
-		throw new Error('Sign in to GitHub to sync object reservations after committing.');
-	}
-	const configuration = vscode.workspace.getConfiguration('object-manager');
-	const owner = configuration.get(REPOSITORY_OWNER_SETTING);
-	const accountId = configuration.get(REPOSITORY_ACCOUNT_SETTING);
-	if (typeof owner !== 'string' || !owner || accountId !== session.account.id) {
-		throw new Error('Choose the GitHub repository owner to sync object reservations after committing.');
-	}
-	const repositoryUrl = `${GITHUB_API_URL}/repos/${encodeURIComponent(owner)}/${RANGE_REPOSITORY_NAME}`;
-	const headers = getGithubHeaders(session);
-	const statuses = await getApplicationObjectStatuses(
-		repositoryUrl,
-		objects,
-		appManifest.manifest.idRanges,
-		headers
-	);
-	extensionUsageProvider.setSyncStatuses(statuses);
-	const results = await syncUnsyncedApplicationObjects(
-		repositoryUrl,
-		statuses,
-		appManifest.manifest.idRanges,
-		headers,
-		extensionUsageProvider
-	);
-	if (results.synced > 0) {
-		vscode.window.showInformationMessage(`Synced ${results.synced} object reservation${results.synced === 1 ? '' : 's'} after commit.`);
-	}
-	if (results.failed > 0) {
-		vscode.window.showErrorMessage(`Commit succeeded, but ${results.failed} object reservation${results.failed === 1 ? '' : 's'} could not be synced. See the Extension Usage view.`);
-	}
-	return results.synced;
-}
-
-/**
- * @param {string} repositoryUrl
- * @param {Array<{ object: ExtensionObject, status: ObjectSyncStatus }>} statuses
- * @param {unknown} ranges
- * @param {GitHubApiHeaders} headers
- * @param {ExtensionUsageDataProvider} extensionUsageProvider
- */
-async function syncUnsyncedApplicationObjects(repositoryUrl, statuses, ranges, headers, extensionUsageProvider) {
-	const unsyncedObjects = statuses.filter(({ status }) => status === 'unsynced');
-	let synced = 0;
-	let failed = 0;
-	for (const { object } of unsyncedObjects) {
-		extensionUsageProvider.setObjectSyncing(object, true);
-		try {
-			const status = await checkAndUploadApplicationObject(repositoryUrl, object, ranges, headers);
-			extensionUsageProvider.setObjectSyncStatus(object, status);
-			if (status === 'synced') {
-				synced++;
-			} else {
-				failed++;
-			}
-		} catch {
-			extensionUsageProvider.setObjectSyncStatus(object, 'unavailable');
-			failed++;
-		} finally {
-			extensionUsageProvider.setObjectSyncing(object, false);
-		}
-	}
-	return { synced, failed };
-}
-
 /** @returns {Promise<GitApi>} */
 async function getGitApi() {
 	const gitExtension = vscode.extensions.getExtension('vscode.git');
@@ -826,455 +740,6 @@ async function getGitApi() {
 
 async function getGitRepositories() {
 	return (await getGitApi()).repositories;
-}
-
-/** @param {string} parentPath @param {string} childPath */
-function isPathWithin(parentPath, childPath) {
-	const relativePath = path.relative(parentPath, childPath);
-	return relativePath === '' || (!relativePath.startsWith(`..${path.sep}`) && relativePath !== '..' && !path.isAbsolute(relativePath));
-}
-
-/** @param {string} remoteUrl */
-function getGithubOwnerFromRemote(remoteUrl) {
-	const scpMatch = /^(?:[^@/]+@)?github\.com:([^/]+)\/([^/]+?)(?:\.git)?$/i.exec(remoteUrl);
-	let host;
-	let repositoryPath;
-	if (scpMatch) {
-		host = 'github.com';
-		repositoryPath = `/${scpMatch[1]}/${scpMatch[2]}`;
-	} else {
-		try {
-			const remote = new URL(remoteUrl);
-			host = remote.hostname.toLowerCase();
-			repositoryPath = remote.pathname;
-		} catch {
-			return undefined;
-		}
-	}
-	if (host !== 'github.com') {
-		return undefined;
-	}
-	const repositorySegments = repositoryPath.split('/').filter(Boolean);
-	if (repositorySegments.length !== 2) {
-		return undefined;
-	}
-	const [owner] = repositorySegments;
-	try {
-		return decodeURIComponent(owner);
-	} catch {
-		return undefined;
-	}
-}
-
-/** @param {{ uri: vscode.Uri }} appManifest */
-async function getApplicationRemoteOwner(appManifest) {
-	try {
-		const appDirectory = path.dirname(appManifest.uri.fsPath);
-		const repositories = (await getGitRepositories())
-			.filter(({ rootUri }) => isPathWithin(rootUri.fsPath, appDirectory))
-			.sort((left, right) => right.rootUri.fsPath.length - left.rootUri.fsPath.length);
-		const repository = repositories[0];
-		if (!repository) {
-			return undefined;
-		}
-		const { stdout: remoteOutput } = await execFileAsync('git', ['remote'], { cwd: repository.rootUri.fsPath });
-		const remotes = remoteOutput.split(/\r?\n/).map((remote) => remote.trim()).filter(Boolean);
-		const remoteName = remotes.includes('origin') ? 'origin' : remotes[0];
-		if (!remoteName) {
-			return undefined;
-		}
-		const { stdout: remoteUrl } = await execFileAsync(
-			'git', ['remote', 'get-url', remoteName], { cwd: repository.rootUri.fsPath }
-		);
-		return getGithubOwnerFromRemote(remoteUrl.trim());
-	} catch {
-		return undefined;
-	}
-}
-
-/** @param {string} rootPath @param {ExtensionObject[]} currentObjects */
-async function collectRepositoryBranchObjects(rootPath, currentObjects) {
-	const { stdout: currentBranchOutput } = await execFileAsync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: rootPath });
-	const currentBranchName = currentBranchOutput.trim();
-	if (!currentBranchName || currentBranchName === 'HEAD') {
-		throw new Error('Check out a branch before syncing repository objects.');
-	}
-	const { stdout: branchOutput } = await execFileAsync(
-		'git', ['for-each-ref', '--format=%(refname:short)', 'refs/heads', 'refs/remotes'], { cwd: rootPath }
-	);
-	const branchNames = [...new Set([
-		currentBranchName,
-		...branchOutput.split(/\r?\n/).map((branch) => branch.trim()).filter((branch) => branch && !branch.endsWith('/HEAD'))
-	])];
-	return Promise.all(branchNames.map(async (branch) => {
-		if (branch === currentBranchName) {
-			return { name: branch, isCurrent: true, objects: currentObjects };
-		}
-		const { stdout: fileOutput } = await execFileAsync(
-			'git', ['ls-tree', '-r', '-z', '--name-only', branch, '--', '*.al'],
-			{ cwd: rootPath, maxBuffer: 50 * 1024 * 1024 }
-		);
-		const files = fileOutput.split('\0').filter(Boolean);
-		const objects = [];
-		for (const file of files) {
-			const { stdout: source } = await execFileAsync(
-				'git', ['show', `${branch}:${file}`], { cwd: rootPath, maxBuffer: 50 * 1024 * 1024 }
-			);
-			objects.push(...parseAlObjects(source));
-		}
-		return { name: branch, isCurrent: false, objects };
-	}));
-}
-
-/** @param {Array<{ name: string, isCurrent: boolean, objects: ExtensionObject[] }>} branches @param {unknown} ranges */
-function analyzeRepositoryBranchObjects(branches, ranges) {
-	/** @type {Array<{ branch: string, object: ExtensionObject, reason: 'conflict' | 'outOfRange' }>} */
-	const conflicts = [];
-	const currentBranch = branches.find(({ isCurrent }) => isCurrent);
-	const currentNames = new Map((currentBranch?.objects || []).map((object) => [getExtensionObjectKey(object), object['object name']]));
-	/** @type {Map<string, Array<{ branch: string, object: ExtensionObject }>>} */
-	const objectsByKey = new Map();
-	for (const { name, objects } of branches) {
-		const duplicates = getDuplicateObjectKeys(objects);
-		for (const object of objects) {
-			const key = getExtensionObjectKey(object);
-			const entries = objectsByKey.get(key) || [];
-			entries.push({ branch: name, object });
-			objectsByKey.set(key, entries);
-			if (!isObjectIdInRanges(object['object id'], ranges)) {
-				conflicts.push({ branch: name, object, reason: 'outOfRange' });
-			} else if (duplicates.has(key)) {
-				conflicts.push({ branch: name, object, reason: 'conflict' });
-			}
-		}
-	}
-	for (const entries of objectsByKey.values()) {
-		const names = new Set(entries.map(({ object }) => object['object name']));
-		if (names.size < 2) {
-			continue;
-		}
-		const currentName = currentNames.get(getExtensionObjectKey(entries[0].object));
-		for (const entry of entries) {
-			if (entry.object['object name'] !== currentName) {
-				conflicts.push({ ...entry, reason: 'conflict' });
-			}
-		}
-	}
-	const syncableObjectKeys = new Set();
-	const syncObjects = [];
-	for (const [key, entries] of objectsByKey) {
-		const inRangeEntries = entries.filter(({ object }) => isObjectIdInRanges(object['object id'], ranges));
-		if (inRangeEntries.length === 0) {
-			continue;
-		}
-		const names = new Set(inRangeEntries.map(({ object }) => object['object name']));
-		const selected = currentBranch
-			? inRangeEntries.find(({ branch }) => branch === currentBranch.name)
-			: undefined;
-		if (names.size > 1 && !selected) {
-			continue;
-		}
-		const object = selected?.object || inRangeEntries[0].object;
-		syncableObjectKeys.add(key);
-		syncObjects.push(object);
-	}
-	return { conflicts, objects: syncObjects, syncableObjectKeys };
-}
-
-/** @param {Array<{ branch: string, object: ExtensionObject, reason: 'conflict' | 'outOfRange' }>} conflicts */
-function formatBranchConflicts(conflicts) {
-	const uniqueConflicts = new Map(conflicts.map(({ branch, object, reason }) => [
-		`${branch}:${getExtensionObjectKey(object)}:${object['object name']}:${reason}`,
-		`${branch}: ${object['object type']} ${object['object id']} ${object['object name']} (${reason === 'outOfRange' ? 'out of range' : 'different names use the same ID'})`
-	]));
-	return [...uniqueConflicts.values()].join('; ');
-}
-
-/** @param {ExtensionObject} object */
-function getObjectKey(object) {
-	return getExtensionObjectKey(object);
-}
-
-/** @param {{ rootUri: vscode.Uri }} repository */
-async function prepareGitHookInstallation(repository) {
-	const rootPath = repository.rootUri.fsPath;
-	const { stdout: configuredHooksPath } = await execFileAsync('git', ['config', '--get', 'core.hooksPath'], { cwd: rootPath }).catch((error) => {
-		if (error.code === 1) {
-			return { stdout: '' };
-		}
-		throw error;
-	});
-	if (configuredHooksPath.trim()) {
-		throw new Error(`A custom core.hooksPath is configured for ${rootPath}; refusing to change it.`);
-	}
-	const { stdout: hooksPath } = await execFileAsync('git', ['rev-parse', '--git-path', 'hooks'], { cwd: rootPath });
-	const hooksDirectory = path.resolve(rootPath, hooksPath.trim());
-	const validationConfigPath = path.resolve(hooksDirectory, '..', 'object-manager-validation.json');
-	for (const hookName of GIT_HOOKS) {
-		const hookPath = path.join(hooksDirectory, hookName);
-		try {
-			const existingHook = await fs.readFile(hookPath, 'utf8');
-			if (!existingHook.includes(GIT_HOOK_MARKER)) {
-				throw new Error(`A ${hookName} hook already exists for ${rootPath}; it was left unchanged.`);
-			}
-		} catch (error) {
-			if (/** @type {NodeJS.ErrnoException} */ (error).code !== 'ENOENT') {
-				throw error;
-			}
-		}
-	}
-	return { rootPath, hooksDirectory, validationConfigPath };
-}
-
-/** @param {{ rootPath: string, hooksDirectory: string, validationConfigPath: string }} installation @param {{ url: string, token: string }} server */
-async function installGitValidationHooksForRepository(installation, server) {
-	const hookSource = await fs.readFile(path.join(__dirname, 'git-validation-hook.js'));
-	await fs.mkdir(installation.hooksDirectory, { recursive: true });
-	for (const hookName of GIT_HOOKS) {
-		const hookPath = path.join(installation.hooksDirectory, hookName);
-		await fs.writeFile(hookPath, hookSource);
-		await fs.chmod(hookPath, 0o755);
-	}
-	await fs.writeFile(installation.validationConfigPath, JSON.stringify(server));
-}
-
-/** @param {{ rootUri: vscode.Uri }} repository */
-async function removeGitValidationHooksForRepository(repository) {
-	const installation = await prepareGitHookInstallation(repository);
-	for (const hookName of GIT_HOOKS) {
-		const hookPath = path.join(installation.hooksDirectory, hookName);
-		try {
-			const existingHook = await fs.readFile(hookPath, 'utf8');
-			if (existingHook.includes(GIT_HOOK_MARKER)) {
-				await fs.rm(hookPath);
-			}
-		} catch (error) {
-			if (/** @type {NodeJS.ErrnoException} */ (error).code !== 'ENOENT') {
-				throw error;
-			}
-		}
-	}
-	await fs.rm(installation.validationConfigPath, { force: true });
-}
-
-/** @returns {Promise<ExtensionObject[]>} */
-async function collectExtensionObjects(failOnReadError = false) {
-	const files = (await vscode.workspace.findFiles(EXTENSION_CONFIG.workspace.alSourcePattern)).sort((left, right) =>
-		left.toString().localeCompare(right.toString())
-	);
-	/** @type {ExtensionObject[]} */
-	const objects = [];
-	for (const file of files) {
-		try {
-			const content = await vscode.workspace.fs.readFile(file);
-			objects.push(...parseAlObjects(Buffer.from(content).toString('utf8')));
-		} catch (error) {
-			if (failOnReadError) {
-				throw new Error(`Unable to read AL source file ${file.toString()}: ${error instanceof Error ? error.message : String(error)}`);
-			}
-			console.warn(`Unable to read AL source file ${file.toString()}:`, error);
-		}
-	}
-	return objects.sort((left, right) =>
-		left['object type'].localeCompare(right['object type']) ||
-		Number(left['object id']) - Number(right['object id'])
-	);
-}
-
-/**
- * @param {string} repositoryUrl
- * @param {ExtensionObject[]} objects
- * @param {unknown} ranges
- * @param {GitHubApiHeaders} headers
- * @returns {Promise<Array<{ object: ExtensionObject, status: ObjectSyncStatus }>>}
- */
-async function getApplicationObjectStatuses(repositoryUrl, objects, ranges, headers) {
-	/** @type {Map<string, Promise<unknown[]>>} */
-	const folderContentsByType = new Map();
-	const duplicateObjectKeys = getDuplicateObjectKeys(objects);
-	return Promise.all(objects.map(async (object) => {
-		if (duplicateObjectKeys.has(`${object['object type']}:${object['object id']}`)) {
-			return { object, status: 'conflict' };
-		}
-		if (!isObjectIdInRanges(object['object id'], ranges)) {
-			return { object, status: 'outOfRange' };
-		}
-		const objectType = object['object type'].toLowerCase();
-		let folderContentsPromise = folderContentsByType.get(objectType);
-		if (!folderContentsPromise) {
-			folderContentsPromise = getObjectTypeFolderContents(repositoryUrl, objectType, headers);
-			folderContentsByType.set(objectType, folderContentsPromise);
-		}
-		const folderContents = await folderContentsPromise;
-		return {
-			object,
-			status: await getReservationFileStatus(folderContents, object, ranges, headers) || 'unsynced'
-		};
-	}));
-}
-
-/** @param {Array<{ object: ExtensionObject, status: string }>} statuses */
-function getObjectValidationFailures(statuses) {
-	return statuses.filter(({ status }) => status === 'conflict' || status === 'outOfRange');
-}
-
-/** @param {string} repositoryUrl @param {string} objectType @param {GitHubApiHeaders} headers */
-async function getObjectTypeFolderContents(repositoryUrl, objectType, headers) {
-	const folderPath = `${OBJECT_RESERVATION_DIRECTORY}/${encodeURIComponent(objectType)}`;
-	const folderUrl = `${repositoryUrl}/contents/${folderPath}?ref=${encodeURIComponent(RANGE_BRANCH)}`;
-	const response = await fetch(folderUrl, { headers });
-	if (response.status === 404) {
-		return [];
-	}
-	if (!response.ok) {
-		throw new Error(await getGithubResponseError(response));
-	}
-	const folderContents = await response.json();
-	if (!Array.isArray(folderContents)) {
-		throw new Error(`GitHub returned an invalid ${folderPath} directory listing.`);
-	}
-	return folderContents;
-}
-
-/**
- * @param {unknown[]} folderContents
- * @param {ExtensionObject} object
- * @param {unknown} ranges
- * @param {GitHubApiHeaders} headers
- * @returns {Promise<ObjectSyncStatus | undefined>}
- */
-async function getReservationFileStatus(folderContents, object, ranges, headers) {
-	const expectedName = normalizeObjectFilename(`${object['object type']}${object['object id']}`);
-	const matchingFiles = folderContents.filter((entry) => {
-		const file = /** @type {{ type?: unknown, name?: unknown }} */ (entry);
-		return file && file.type === 'file' && typeof file.name === 'string' &&
-			normalizeObjectFilename(file.name) === expectedName;
-	});
-	if (matchingFiles.length === 0) {
-		return undefined;
-	}
-	if (matchingFiles.length > 1) {
-		return 'conflict';
-	}
-	const fileEntry = /** @type {{ url?: unknown }} */ (matchingFiles[0]);
-	if (typeof fileEntry.url !== 'string') {
-		return 'conflict';
-	}
-	const file = /** @type {GitHubContentsFile} */ (await getGithubJson(fileEntry.url, headers));
-	let remoteRecord;
-	try {
-		const content = Buffer.from(file.content.replace(/\s/g, ''), 'base64').toString('utf8');
-		remoteRecord = JSON.parse(content);
-	} catch {
-		remoteRecord = null;
-	}
-	return classifyObjectSyncStatus(object, ranges, remoteRecord);
-}
-
-/**
- * @param {string} repositoryUrl
- * @param {ExtensionObject} object
- * @param {unknown} ranges
- * @param {GitHubApiHeaders} headers
- * @returns {Promise<ObjectSyncStatus>}
- */
-async function checkAndUploadApplicationObject(repositoryUrl, object, ranges, headers) {
-	if (!isObjectIdInRanges(object['object id'], ranges)) {
-		return 'outOfRange';
-	}
-	const objectType = object['object type'].toLowerCase();
-	const folderPath = `${OBJECT_RESERVATION_DIRECTORY}/${encodeURIComponent(objectType)}`;
-	const folderUrl = `${repositoryUrl}/contents/${folderPath}?ref=${encodeURIComponent(RANGE_BRANCH)}`;
-	const folderContents = await getObjectTypeFolderContents(repositoryUrl, objectType, headers);
-	const existingStatus = await getReservationFileStatus(folderContents, object, ranges, headers);
-	if (existingStatus) {
-		return existingStatus;
-	}
-	const filePath = `${folderPath}/${encodeURIComponent(`${objectType}${object['object id']}`)}`;
-	const fileUrl = `${repositoryUrl}/contents/${filePath}`;
-	const reservation = {
-		name: object['object name'],
-		timestamp: new Date().toISOString(),
-		repo: repositoryUrl
-	};
-	const response = await fetch(fileUrl, {
-		method: 'PUT',
-		headers,
-		body: JSON.stringify({
-			message: `Add reservation for ${object['object type']} ${object['object id']}`,
-			content: Buffer.from(JSON.stringify(reservation, null, 4)).toString('base64'),
-			branch: RANGE_BRANCH
-		})
-	});
-	if (response.status === 409 || response.status === 422) {
-		const latestContents = await getGithubJson(folderUrl, headers);
-		if (!Array.isArray(latestContents)) {
-			throw new Error(`GitHub returned an invalid ${folderPath} directory listing.`);
-		}
-		return await getReservationFileStatus(latestContents, object, ranges, headers) || 'conflict';
-	}
-	if (!response.ok) {
-		throw new Error(await getGithubResponseError(response));
-	}
-	return 'synced';
-}
-
-/** @param {string} repositoryUrl @param {ExtensionObject} object @param {unknown} ranges @param {GitHubApiHeaders} headers */
-async function upsertApplicationObjectReservation(repositoryUrl, object, ranges, headers) {
-	if (!isObjectIdInRanges(object['object id'], ranges)) {
-		return 'outOfRange';
-	}
-	const objectType = object['object type'].toLowerCase();
-	const folderPath = `${OBJECT_RESERVATION_DIRECTORY}/${encodeURIComponent(objectType)}`;
-	const folderContents = await getObjectTypeFolderContents(repositoryUrl, objectType, headers);
-	const expectedName = normalizeObjectFilename(`${objectType}${object['object id']}`);
-	const matchingFiles = folderContents.filter((entry) => {
-		const file = /** @type {{ type?: unknown, name?: unknown }} */ (entry);
-		return file && file.type === 'file' && typeof file.name === 'string' && normalizeObjectFilename(file.name) === expectedName;
-	});
-	if (matchingFiles.length === 0) {
-		return checkAndUploadApplicationObject(repositoryUrl, object, ranges, headers);
-	}
-	if (matchingFiles.length > 1) {
-		return 'conflict';
-	}
-	const existing = /** @type {{ url?: unknown, name?: unknown }} */ (matchingFiles[0]);
-	if (typeof existing.url !== 'string' || typeof existing.name !== 'string') {
-		return 'conflict';
-	}
-	const existingFile = /** @type {GitHubContentsFile} */ (await getGithubJson(existing.url, headers));
-	const existingContent = Buffer.from(existingFile.content.replace(/\s/g, ''), 'base64').toString('utf8');
-	let existingRecord;
-	try {
-		existingRecord = JSON.parse(existingContent);
-	} catch {
-		return 'conflict';
-	}
-	if (classifyObjectSyncStatus(object, ranges, existingRecord) !== 'synced' || typeof existingFile.sha !== 'string') {
-		return 'conflict';
-	}
-	const filePath = `${folderPath}/${encodeURIComponent(existing.name)}`;
-	const response = await fetch(`${repositoryUrl}/contents/${filePath}`, {
-		method: 'PUT',
-		headers,
-		body: JSON.stringify({
-			message: `Update reservation for ${object['object type']} ${object['object id']}`,
-			content: Buffer.from(JSON.stringify({
-				name: object['object name'],
-				timestamp: new Date().toISOString(),
-				repo: repositoryUrl
-			}, null, 4)).toString('base64'),
-			sha: existingFile.sha,
-			branch: RANGE_BRANCH
-		})
-	});
-	if (response.status === 409 || response.status === 422) {
-		return 'conflict';
-	}
-	if (!response.ok) {
-		throw new Error(await getGithubResponseError(response));
-	}
-	return 'synced';
 }
 
 /** @param {unknown} manifest */
@@ -1382,7 +847,7 @@ async function configureGithubRepositoryOwner(
 			(!configuredOwnerIsValid || configuredOwnerSource === 'remote' || configuredOwnerSource === 'default')
 		) {
 			await saveRepositoryOwner(matchingRemoteOwner, session.account.id, 'remote');
-			await ensureRangeRepository(
+			await ensureGithubRangeRepository(
 				matchingRemoteOwner, accountLogin, headers, organizationUsageProvider, debugProvider,
 				rangeDiagnostics, manualRangeUpdate, extensionUsageProvider
 			);
@@ -1391,7 +856,7 @@ async function configureGithubRepositoryOwner(
 
 		if (organizations.length === 0) {
 			await saveRepositoryOwner(accountLogin, session.account.id, 'default');
-			await ensureRangeRepository(
+			await ensureGithubRangeRepository(
 				accountLogin, accountLogin, headers, organizationUsageProvider, debugProvider,
 				rangeDiagnostics, manualRangeUpdate, extensionUsageProvider
 			);
@@ -1403,7 +868,7 @@ async function configureGithubRepositoryOwner(
 			(configuredOwnerSource === 'remote' || configuredOwnerSource === 'default')
 		);
 		if (!showAccountPicker && configuredOwnerIsValid && !staleRemoteOwner) {
-			await ensureRangeRepository(
+			await ensureGithubRangeRepository(
 				configuredOwner, accountLogin, headers, organizationUsageProvider, debugProvider,
 				rangeDiagnostics, manualRangeUpdate, extensionUsageProvider
 			);
@@ -1428,7 +893,7 @@ async function configureGithubRepositoryOwner(
 
 		if (selection) {
 			await saveRepositoryOwner(selection.owner, session.account.id, 'user');
-			await ensureRangeRepository(
+			await ensureGithubRangeRepository(
 				selection.owner, accountLogin, headers, organizationUsageProvider, debugProvider,
 				rangeDiagnostics, manualRangeUpdate, extensionUsageProvider
 			);
@@ -1461,232 +926,6 @@ async function getGithubOrganizations(headers) {
 	}
 }
 
-/**
- * @param {string} owner
- * @param {string} accountLogin
- * @param {GitHubApiHeaders} headers
- * @param {OrganizationUsageDataProvider} [organizationUsageProvider]
- * @param {GithubDebugDataProvider} [debugProvider]
- * @param {vscode.DiagnosticCollection} [rangeDiagnostics]
- * @param {boolean} [manualRangeUpdate]
- * @param {ExtensionUsageDataProvider} [extensionUsageProvider]
- */
-async function ensureRangeRepository(
-	owner,
-	accountLogin,
-	headers,
-	organizationUsageProvider,
-	debugProvider,
-	rangeDiagnostics,
-	manualRangeUpdate = false,
-	extensionUsageProvider
-) {
-	const repositoryPath = `/repos/${encodeURIComponent(owner)}/${RANGE_REPOSITORY_NAME}`;
-	const repositoryUrl = `${GITHUB_API_URL}${repositoryPath}`;
-	const repositoryResponse = await fetch(repositoryUrl, { headers });
-	let rangeData;
-
-	if (repositoryResponse.status === 404) {
-		const createUrl = owner === accountLogin
-			? `${GITHUB_API_URL}/user/repos`
-			: `${GITHUB_API_URL}/orgs/${encodeURIComponent(owner)}/repos`;
-		let repository = /** @type {GitHubRepository} */ (await getGithubJson(
-			createUrl,
-			headers,
-			{
-				method: 'POST',
-				body: JSON.stringify({
-						name: RANGE_REPOSITORY_NAME,
-					private: true,
-					auto_init: true
-				})
-			}
-		));
-		await ensureMainBranch(owner, repository, headers);
-		await createRangeFile(repositoryUrl, headers);
-		rangeData = INITIAL_RANGE_DATA;
-	} else {
-		if (!repositoryResponse.ok) {
-			throw new Error(await getGithubResponseError(repositoryResponse));
-		}
-
-		const contentsUrl = `${repositoryUrl}/contents/${encodeURIComponent(RANGE_FILE_NAME)}?ref=${encodeURIComponent(RANGE_BRANCH)}`;
-		const contentsResponse = await fetch(contentsUrl, { headers });
-		if (contentsResponse.status === 404) {
-			await createRangeFile(repositoryUrl, headers);
-			rangeData = INITIAL_RANGE_DATA;
-		} else {
-			if (!contentsResponse.ok) {
-				throw new Error(await getGithubResponseError(contentsResponse));
-			}
-			const file = /** @type {GitHubContentsFile} */ (await contentsResponse.json());
-			rangeData = parseRangeData(file);
-		}
-	}
-
-	const appManifest = await getAlApplicationManifest();
-	const applicationRegistration = appManifest
-		? createApplicationRegistration(appManifest.manifest)
-		: undefined;
-	if (appManifest && applicationRegistration) {
-		const registration = applicationRegistration;
-		const existingRegistration = rangeData.ranges.find((item) => item.id === registration.id);
-		if (existingRegistration) {
-			rangeDiagnostics?.delete(appManifest.uri);
-		} else {
-			setMissingRangeDiagnostic(rangeDiagnostics, appManifest.uri);
-			const contentsUrl = `${repositoryUrl}/contents/${encodeURIComponent(RANGE_FILE_NAME)}`;
-			const latestResponse = await fetch(`${contentsUrl}?ref=${encodeURIComponent(RANGE_BRANCH)}`, { headers });
-			if (!latestResponse.ok) {
-				throw new Error(await getGithubResponseError(latestResponse));
-			}
-			const latestFile = /** @type {GitHubContentsFile} */ (await latestResponse.json());
-			const latestData = parseRangeData(latestFile);
-			if (latestData.ranges.some((item) => item.id === registration.id)) {
-				rangeData = latestData;
-				rangeDiagnostics?.delete(appManifest.uri);
-			} else {
-				const updatedData = { ...latestData, ranges: [...latestData.ranges, registration] };
-				const updateResponse = await fetch(contentsUrl, {
-					method: 'PUT',
-					headers,
-					body: JSON.stringify({
-						message: `${manualRangeUpdate ? 'Manually add' : 'Add'} ${registration.name} application range`,
-						content: Buffer.from(JSON.stringify(updatedData, null, 4)).toString('base64'),
-						sha: latestFile.sha,
-						branch: RANGE_BRANCH
-					})
-				});
-				if (updateResponse.status === 409 || updateResponse.status === 422) {
-					const refreshedResponse = await fetch(`${contentsUrl}?ref=${encodeURIComponent(RANGE_BRANCH)}`, { headers });
-					let refreshError;
-					if (refreshedResponse.ok) {
-						rangeData = parseRangeData(/** @type {GitHubContentsFile} */ (await refreshedResponse.json()));
-					} else {
-						refreshError = await getGithubResponseError(refreshedResponse);
-					}
-					if (rangeData.ranges.some((item) => item.id === registration.id)) {
-						rangeDiagnostics?.delete(appManifest.uri);
-					} else {
-						setMissingRangeDiagnostic(rangeDiagnostics, appManifest.uri);
-					}
-					const action = 'Create/Update Application Range';
-					const selection = await vscode.window.showErrorMessage(
-						refreshError
-							? `The range data changed while saving. Unable to reload ${RANGE_FILE_NAME}: ${refreshError}. Run ${action} to try again.`
-							: `The range data changed while saving. ${RANGE_FILE_NAME} was downloaded again. Run ${action} to try again.`,
-						action
-					);
-					if (selection === action) {
-						void vscode.commands.executeCommand('object-manager.createUpdateApplicationRange');
-					}
-				} else if (!updateResponse.ok) {
-					throw new Error(await getGithubResponseError(updateResponse));
-				} else {
-					rangeData = updatedData;
-					rangeDiagnostics?.delete(appManifest.uri);
-				}
-			}
-		}
-		const repositoryRegistration = rangeData.ranges.find((item) => item.id === applicationRegistration.id);
-		if (repositoryRegistration && !areRangesEqual(applicationRegistration.ranges, repositoryRegistration.ranges)) {
-			const promptKey = `${owner}:${applicationRegistration.id}:${JSON.stringify(applicationRegistration.ranges)}:${JSON.stringify(repositoryRegistration.ranges)}`;
-			if (!promptedRangeMismatches.has(promptKey)) {
-				promptedRangeMismatches.add(promptKey);
-				const useRepositoryRange = 'Update app.json from data.json';
-				const keepApplicationRange = 'Keep app.json range';
-				const selection = await vscode.window.showWarningMessage(
-					`The ${RANGE_FILE_NAME} range for ${applicationRegistration.name} differs from app.json. Use the upstream range in app.json?`,
-					useRepositoryRange,
-					keepApplicationRange
-				);
-				if (selection === useRepositoryRange) {
-					await updateApplicationManifestRanges(appManifest, repositoryRegistration.ranges);
-					applicationRegistration.ranges = repositoryRegistration.ranges;
-					appManifest.manifest.idRanges = repositoryRegistration.ranges;
-				}
-			}
-		}
-		const localObjects = extensionUsageProvider?.getObjects() || await collectExtensionObjects();
-		const syncStatuses = await getApplicationObjectStatuses(
-			repositoryUrl,
-			localObjects,
-			registration.ranges,
-			headers
-		);
-		extensionUsageProvider?.setSyncStatuses(syncStatuses);
-	}
-
-	organizationUsageProvider?.setRangeData(owner, rangeData, applicationRegistration);
-	debugProvider?.setRemarks(rangeData.Remarks);
-}
-
-/**
- * @param {string} owner
- * @param {RangeRegistration} registration
- * @param {GitHubApiHeaders} headers
- */
-async function forceApplicationRangeToRepositoryData(owner, registration, headers) {
-	const repositoryUrl = `${GITHUB_API_URL}/repos/${encodeURIComponent(owner)}/${RANGE_REPOSITORY_NAME}`;
-	const contentsUrl = `${repositoryUrl}/contents/${encodeURIComponent(RANGE_FILE_NAME)}`;
-	const latestResponse = await fetch(`${contentsUrl}?ref=${encodeURIComponent(RANGE_BRANCH)}`, { headers });
-	if (!latestResponse.ok) {
-		throw new Error(await getGithubResponseError(latestResponse));
-	}
-	const latestFile = /** @type {GitHubContentsFile} */ (await latestResponse.json());
-	const latestData = parseRangeData(latestFile);
-	const registrationIndex = latestData.ranges.findIndex((item) => item.id === registration.id);
-	if (registrationIndex < 0) {
-		throw new Error(`The application is no longer registered in ${RANGE_FILE_NAME}. Refresh organization usage and try again.`);
-	}
-	if (areRangesEqual(latestData.ranges[registrationIndex].ranges, registration.ranges)) {
-		return false;
-	}
-
-	latestData.ranges[registrationIndex] = {
-		...latestData.ranges[registrationIndex],
-		ranges: registration.ranges
-	};
-	const updateResponse = await fetch(contentsUrl, {
-		method: 'PUT',
-		headers,
-		body: JSON.stringify({
-			message: `Update ${registration.name} application range`,
-			content: Buffer.from(JSON.stringify(latestData, null, 4)).toString('base64'),
-			sha: latestFile.sha,
-			branch: RANGE_BRANCH
-		})
-	});
-	if (!updateResponse.ok) {
-		throw new Error(await getGithubResponseError(updateResponse));
-	}
-	return true;
-}
-
-/** @param {GitHubContentsFile} file @returns {RangeData} */
-function parseRangeData(file) {
-	const fileContent = Buffer.from(file.content.replace(/\s/g, ''), 'base64').toString('utf8');
-	const parsedRangeData = /** @type {RangeData} */ (JSON.parse(fileContent));
-	if (
-		!parsedRangeData ||
-		!Array.isArray(parsedRangeData.Remarks) ||
-		!Array.isArray(parsedRangeData.ranges)
-	) {
-		throw new Error(`${RANGE_FILE_NAME} must contain Remarks and ranges arrays.`);
-	}
-	return parsedRangeData;
-}
-
-/** @param {Record<string, any>} manifest @returns {RangeRegistration} */
-function createApplicationRegistration(manifest) {
-	return {
-		id: manifest.id,
-		name: typeof manifest.name === 'string' ? manifest.name : '',
-		publisher: typeof manifest.publisher === 'string' ? manifest.publisher : '',
-		ranges: Array.isArray(manifest.idRanges) ? manifest.idRanges : []
-	};
-}
-
 /** @returns {Promise<{ uri: vscode.Uri, manifest: Record<string, any> } | undefined>} */
 async function getAlApplicationManifest() {
 	for (const folder of vscode.workspace.workspaceFolders || []) {
@@ -1700,73 +939,6 @@ async function getAlApplicationManifest() {
 		} catch {}
 	}
 	return undefined;
-}
-
-/** @param {{ uri: vscode.Uri, manifest: Record<string, any> }} appManifest @param {Array<{ from: number, to: number }>} ranges */
-async function updateApplicationManifestRanges(appManifest, ranges) {
-	const content = await vscode.workspace.fs.readFile(appManifest.uri);
-	const currentManifest = JSON.parse(Buffer.from(content).toString('utf8'));
-	if (currentManifest.id !== appManifest.manifest.id) {
-		throw new Error('The application manifest changed before its range could be updated.');
-	}
-	currentManifest.idRanges = ranges;
-	await vscode.workspace.fs.writeFile(
-		appManifest.uri,
-		Buffer.from(JSON.stringify(currentManifest, null, 4))
-	);
-}
-
-/** @param {vscode.DiagnosticCollection | undefined} diagnostics @param {vscode.Uri} uri */
-function setMissingRangeDiagnostic(diagnostics, uri) {
-	if (!diagnostics) {
-		return;
-	}
-	const diagnostic = new vscode.Diagnostic(
-		new vscode.Range(0, 0, 0, 0),
-		`Application range is missing from ${RANGE_FILE_NAME}. Run "Create/Update Application Range" to add it.`,
-		vscode.DiagnosticSeverity.Error
-	);
-	diagnostic.source = 'BC Object Manager';
-	diagnostics.set(uri, [diagnostic]);
-}
-
-/**
- * @param {string} owner
- * @param {GitHubRepository} repository
- * @param {GitHubApiHeaders} headers
- * @returns {Promise<GitHubRepository>}
- */
-async function ensureMainBranch(owner, repository, headers) {
-	if (repository.default_branch === RANGE_BRANCH) {
-		return repository;
-	}
-
-	const repositoryPath = `/repos/${encodeURIComponent(owner)}/${RANGE_REPOSITORY_NAME}`;
-	const sourceReference = /** @type {GitHubReference} */ (await getGithubJson(
-		`${GITHUB_API_URL}${repositoryPath}/git/ref/heads/${encodeURIComponent(repository.default_branch)}`,
-		headers
-	));
-	await getGithubJson(`${GITHUB_API_URL}${repositoryPath}/git/refs`, headers, {
-		method: 'POST',
-		body: JSON.stringify({ ref: `refs/heads/${RANGE_BRANCH}`, sha: sourceReference.object.sha })
-	});
-	return /** @type {GitHubRepository} */ (await getGithubJson(
-		`${GITHUB_API_URL}${repositoryPath}`,
-		headers,
-		{ method: 'PATCH', body: JSON.stringify({ default_branch: RANGE_BRANCH }) }
-	));
-}
-
-/** @param {string} repositoryUrl @param {GitHubApiHeaders} headers */
-async function createRangeFile(repositoryUrl, headers) {
-	await getGithubJson(`${repositoryUrl}/contents/${encodeURIComponent(RANGE_FILE_NAME)}`, headers, {
-		method: 'PUT',
-		body: JSON.stringify({
-			message: `Add initial ${RANGE_FILE_NAME}`,
-			content: Buffer.from(JSON.stringify(INITIAL_RANGE_DATA, null, 4)).toString('base64'),
-			branch: RANGE_BRANCH
-		})
-	});
 }
 
 /** @param {Response} response */
@@ -1825,9 +997,9 @@ module.exports = {
 	deactivate,
 	isValidAlManifest,
 	hasAlWorkspace,
-	createApplicationRegistration,
+	createApplicationRegistration: createGithubApplicationRegistration,
 	areRangesEqual,
-	forceApplicationRangeToRepositoryData,
+	forceApplicationRangeToRepositoryData: forceGithubApplicationRangeToRepositoryData,
 	parseAlObjects,
 	collectExtensionObjects,
 	isObjectIdInRanges,
