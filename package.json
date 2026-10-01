@@ -22,6 +22,10 @@
   "contributes": {
     "commands": [
       {
+        "command": "object-manager.suggestAvailableObjectId",
+        "title": "Object Manager: Suggest Available Object ID"
+      },
+      {
         "command": "object-manager.manageAccountPreference",
         "title": "Object Manager: Manage Account Preference"
       },
@@ -56,6 +60,13 @@
       {
         "command": "object-manager.removeGitValidationHooks",
         "title": "Object Manager: Remove Git Validation Hooks"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "object-manager.suggestAvailableObjectId",
+        "key": "ctrl+space",
+        "when": "editorTextFocus && editorLangId == al"
       }
     ],
     "menus": {

@@ -41,11 +41,80 @@ function isObjectIdInRanges(objectId, ranges) {
 	);
 }
 
+/** @param {unknown} range @returns {range is { from: number, to: number }} */
+function isValidObjectIdRange(range) {
+	if (!range || typeof range !== 'object') {
+		return false;
+	}
+	const candidate = /** @type {{ from?: unknown, to?: unknown }} */ (range);
+	return typeof candidate.from === 'number' && typeof candidate.to === 'number' &&
+		Number.isSafeInteger(candidate.from) && Number.isSafeInteger(candidate.to) &&
+		candidate.from <= candidate.to;
+}
+
+/** @param {string} objectType @param {ExtensionObject[]} objects @param {unknown} ranges @returns {string | undefined} */
+function getNextAvailableObjectId(objectType, objects, ranges) {
+	if (!Array.isArray(ranges)) {
+		return undefined;
+	}
+	const normalizedType = objectType.toLowerCase();
+	const usedIds = objects
+		.filter((object) => object['object type'].toLowerCase() === normalizedType)
+		.map((object) => Number(object['object id']))
+		.filter(Number.isSafeInteger)
+		.sort((left, right) => left - right);
+	const sortedRanges = /** @type {unknown[]} */ (ranges)
+		.filter(isValidObjectIdRange)
+		.sort((left, right) => left.from - right.from || left.to - right.to);
+
+	for (const range of sortedRanges) {
+		let candidate = range.from;
+		for (const usedId of usedIds) {
+			if (usedId < candidate) {
+				continue;
+			}
+			if (usedId > range.to) {
+				break;
+			}
+			if (usedId > candidate) {
+				break;
+			}
+			candidate++;
+		}
+		if (candidate <= range.to) {
+			return String(candidate);
+		}
+	}
+	return undefined;
+}
+
+/** @param {string} line @param {number} cursor @returns {{ objectType: string, start: number, end: number } | undefined} */
+function getObjectIdSlot(line, cursor) {
+	const match = /^(\s*)(table|report|codeunit|xmlport|menusuite|page|query)(\s+)(\d*)(.*)$/i.exec(line);
+	if (!match) {
+		return undefined;
+	}
+	const objectType = match[2].toLowerCase();
+	const objectTypes = /** @type {Record<string, string>} */ ({
+		table: 'Table',
+		report: 'Report',
+		codeunit: 'Codeunit',
+		xmlport: 'XMLport',
+		menusuite: 'MenuSuite',
+		page: 'Page',
+		query: 'Query'
+	});
+	const start = match[1].length + match[2].length + match[3].length;
+	const end = start + match[4].length;
+	return cursor >= start && cursor <= end ? { objectType: objectTypes[objectType], start, end } : undefined;
+}
+
 /** @param {unknown} left @param {unknown} right */
 function areRangesEqual(left, right) {
 	if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
 		return false;
 	}
+	/** @param {Array<{ from?: number, to?: number } | null | undefined>} ranges */
 	const sortRanges = (ranges) => [...ranges].sort((first, second) =>
 		(first?.from ?? 0) - (second?.from ?? 0) || (first?.to ?? 0) - (second?.to ?? 0)
 	);
@@ -59,6 +128,16 @@ function areRangesEqual(left, right) {
 /** @param {ExtensionObject} object */
 function getExtensionObjectKey(object) {
 	return `${object['object type']}:${object['object id']}`;
+}
+
+/** @param {ExtensionObject[]} objects @returns {Set<string>} */
+function getDuplicateObjectKeys(objects) {
+	const counts = new Map();
+	for (const object of objects) {
+		const key = getExtensionObjectKey(object);
+		counts.set(key, (counts.get(key) || 0) + 1);
+	}
+	return new Set([...counts].filter(([, count]) => count > 1).map(([key]) => key));
 }
 
 /** @param {string} filename */
@@ -89,8 +168,11 @@ function classifyObjectSyncStatus(object, ranges, remoteRecord) {
 module.exports = {
 	parseAlObjects,
 	isObjectIdInRanges,
+	getNextAvailableObjectId,
+	getObjectIdSlot,
 	areRangesEqual,
 	getExtensionObjectKey,
+	getDuplicateObjectKeys,
 	normalizeObjectFilename,
 	classifyObjectSyncStatus
 };

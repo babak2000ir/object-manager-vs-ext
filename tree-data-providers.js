@@ -1,11 +1,18 @@
 const vscode = require('vscode');
 const EXTENSION_CONFIG = require('./config.json');
-const { getExtensionObjectKey, isObjectIdInRanges, areRangesEqual } = require('./object-model');
+const {
+	getExtensionObjectKey,
+	getDuplicateObjectKeys,
+	isObjectIdInRanges,
+	getNextAvailableObjectId,
+	areRangesEqual
+} = require('./object-model');
 
 const RANGE_REPOSITORY_NAME = EXTENSION_CONFIG.rangeRepository.name;
 const RANGE_REPOSITORY_DISPLAY_NAME = EXTENSION_CONFIG.rangeRepository.displayName;
 const RANGE_FILE_NAME = EXTENSION_CONFIG.rangeRepository.fileName;
 const RANGE_BRANCH = EXTENSION_CONFIG.rangeRepository.branch;
+const AL_OBJECT_TYPES = ['Table', 'Report', 'Codeunit', 'XMLport', 'MenuSuite', 'Page', 'Query'];
 
 /** @typedef {{ 'object type': string, 'object name': string, 'object id': string }} ExtensionObject */
 /** @typedef {'outOfRange' | 'conflict' | 'synced' | 'unsynced' | 'checking' | 'unavailable'} ObjectSyncStatus */
@@ -82,6 +89,10 @@ class ExtensionUsageDataProvider extends TreeDataProvider {
 		this.ranges = undefined;
 		/** @type {Map<string, { status: ObjectSyncStatus, name: string }>} */
 		this.remoteStatuses = new Map();
+		/** @type {Map<string, string | undefined>} */
+		this.nextAvailableIds = new Map();
+		/** @type {Set<string>} */
+		this.duplicateObjectKeys = new Set();
 		/** @type {Set<string>} */
 		this.syncingObjects = new Set();
 		/** @type {string | undefined} */
@@ -91,11 +102,18 @@ class ExtensionUsageDataProvider extends TreeDataProvider {
 	/** @param {ExtensionObject[]} objects @param {unknown} ranges */
 	setObjects(objects, ranges) {
 		this.ranges = ranges;
+		this.duplicateObjectKeys = getDuplicateObjectKeys(objects);
+		this.nextAvailableIds = new Map(AL_OBJECT_TYPES.map((objectType) => [
+			objectType,
+			getNextAvailableObjectId(objectType, objects, ranges)
+		]));
 		this.syncError = undefined;
 		this.objects = objects.map((object) => {
 			const key = getExtensionObjectKey(object);
 			const remoteStatus = this.remoteStatuses.get(key);
-			const status = !isObjectIdInRanges(object['object id'], ranges)
+			const status = this.duplicateObjectKeys.has(key)
+				? 'conflict'
+				: !isObjectIdInRanges(object['object id'], ranges)
 				? 'outOfRange'
 				: remoteStatus?.name === object['object name']
 					? remoteStatus.status
@@ -112,6 +130,11 @@ class ExtensionUsageDataProvider extends TreeDataProvider {
 			'object name': object['object name'],
 			'object id': object['object id']
 		}));
+	}
+
+	/** @param {string} objectType @returns {string | undefined} */
+	getNextAvailableObjectId(objectType) {
+		return this.nextAvailableIds.get(objectType);
 	}
 
 	/** @param {ExtensionObject} object @returns {ExtensionUsageEntry | undefined} */
@@ -159,7 +182,9 @@ class ExtensionUsageDataProvider extends TreeDataProvider {
 		]));
 		this.objects = this.objects.map((entry) => ({
 			...entry,
-			syncStatus: !isObjectIdInRanges(entry['object id'], this.ranges)
+			syncStatus: this.duplicateObjectKeys.has(getExtensionObjectKey(entry))
+				? 'conflict'
+				: !isObjectIdInRanges(entry['object id'], this.ranges)
 				? 'outOfRange'
 				: this.remoteStatuses.get(getExtensionObjectKey(entry))?.status || 'checking'
 		}));
@@ -171,7 +196,9 @@ class ExtensionUsageDataProvider extends TreeDataProvider {
 		this.syncError = message;
 		this.objects = this.objects.map((entry) => ({
 			...entry,
-			syncStatus: isObjectIdInRanges(entry['object id'], this.ranges) ? 'unavailable' : 'outOfRange'
+			syncStatus: this.duplicateObjectKeys.has(getExtensionObjectKey(entry))
+				? 'conflict'
+				: isObjectIdInRanges(entry['object id'], this.ranges) ? 'unavailable' : 'outOfRange'
 		}));
 		this.renderObjects();
 	}

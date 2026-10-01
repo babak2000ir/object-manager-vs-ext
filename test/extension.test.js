@@ -11,13 +11,16 @@ const execFileAsync = promisify(execFile);
 const vscode = require('vscode');
 const EXTENSION_CONFIG = require('../config.json');
 const { activateOnTriggers } = require('../feature-lifecycle');
-const { OrganizationUsageDataProvider } = require('../tree-data-providers');
+const { ExtensionUsageDataProvider, OrganizationUsageDataProvider } = require('../tree-data-providers');
 const {
 	hasAlWorkspace,
 	createApplicationRegistration,
 	areRangesEqual,
 	parseAlObjects,
 	isObjectIdInRanges,
+	getNextAvailableObjectId,
+	getObjectIdSlot,
+	getDuplicateObjectKeys,
 	classifyObjectSyncStatus,
 	getApplicationObjectStatuses,
 	getObjectValidationFailures,
@@ -250,6 +253,75 @@ query 50105 CustomerQuery {}`;
 		assert.strictEqual(isObjectIdInRanges('50100', ranges), false);
 		assert.strictEqual(isObjectIdInRanges('60010', ranges), true);
 		assert.strictEqual(isObjectIdInRanges('1', undefined), false);
+	});
+
+	test('Suggests the first unused ID in app ranges for each object type', () => {
+		const objects = [
+			{ 'object type': 'Page', 'object name': 'First', 'object id': '50000' },
+			{ 'object type': 'Page', 'object name': 'Third', 'object id': '50002' },
+			{ 'object type': 'Table', 'object name': 'FirstTable', 'object id': '50000' }
+		];
+		const ranges = [{ from: 50000, to: 50002 }, { from: 60000, to: 60001 }];
+
+		assert.strictEqual(getNextAvailableObjectId('Page', objects, ranges), '50001');
+		assert.strictEqual(getNextAvailableObjectId('Table', objects, ranges), '50001');
+		assert.strictEqual(getNextAvailableObjectId('Report', objects, ranges), '50000');
+		assert.strictEqual(getNextAvailableObjectId('Page', [
+			...objects,
+			{ 'object type': 'Page', 'object name': 'Second', 'object id': '50001' }
+		], ranges), '60000');
+		assert.strictEqual(getNextAvailableObjectId('Page', objects, []), undefined);
+		assert.strictEqual(getNextAvailableObjectId('Page', [
+			...objects,
+			{ 'object type': 'Page', 'object name': 'Unsynced', 'object id': '50001' }
+		], ranges), '60000');
+
+		const provider = new ExtensionUsageDataProvider();
+		provider.setObjects(objects, ranges);
+		assert.strictEqual(provider.getNextAvailableObjectId('Page'), '50001');
+		assert.strictEqual(provider.getNextAvailableObjectId('Report'), '50000');
+	});
+
+	test('Marks repeated local IDs of the same object type as conflicts', async () => {
+		const duplicateObjects = [
+			{ 'object type': 'Page', 'object name': 'FirstPage', 'object id': '50000' },
+			{ 'object type': 'Page', 'object name': 'SecondPage', 'object id': '50000' },
+			{ 'object type': 'Table', 'object name': 'FirstTable', 'object id': '50000' }
+		];
+		const duplicateKeys = getDuplicateObjectKeys(duplicateObjects);
+		assert.deepStrictEqual([...duplicateKeys], ['Page:50000']);
+
+		const provider = new ExtensionUsageDataProvider();
+		provider.setObjects(duplicateObjects, [{ from: 50000, to: 50010 }]);
+		assert.deepStrictEqual(provider.objects.map(({ syncStatus }) => syncStatus), [
+			'conflict', 'conflict', 'checking'
+		]);
+		provider.setSyncStatuses(duplicateObjects.map((object) => ({ object, status: 'synced' })));
+		assert.deepStrictEqual(provider.objects.map(({ syncStatus }) => syncStatus), [
+			'conflict', 'conflict', 'synced'
+		]);
+
+		const duplicateStatuses = await getApplicationObjectStatuses(
+			'https://example.test/repository',
+			duplicateObjects.slice(0, 2),
+			[{ from: 50000, to: 50010 }],
+			{}
+		);
+		assert.deepStrictEqual(duplicateStatuses.map(({ status }) => status), ['conflict', 'conflict']);
+	});
+
+	test('Identifies only the object ID slot in an AL declaration', () => {
+		assert.deepStrictEqual(getObjectIdSlot('    page 50001 "Customer Card"', 13), {
+			objectType: 'Page',
+			start: 9,
+			end: 14
+		});
+		assert.deepStrictEqual(getObjectIdSlot('table   ', 8), {
+			objectType: 'Table',
+			start: 8,
+			end: 8
+		});
+		assert.strictEqual(getObjectIdSlot('page 50001 "Customer Card"', 20), undefined);
 	});
 
 	test('Classifies local object reservation sync states', () => {

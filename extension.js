@@ -11,6 +11,9 @@ const { promisify } = require('util');
 const {
 	parseAlObjects,
 	isObjectIdInRanges,
+	getNextAvailableObjectId,
+	getObjectIdSlot,
+	getDuplicateObjectKeys,
 	areRangesEqual,
 	normalizeObjectFilename,
 	classifyObjectSyncStatus
@@ -283,6 +286,7 @@ function startFeatures(featureDisposables) {
 				const rangeTreeItem = /** @type {ApplicationRangeTreeItem | undefined} */ (treeItem);
 				if (
 					!rangeTreeItem ||
+					typeof rangeTreeItem.applicationId !== 'string' ||
 					rangeTreeItem.applicationId !== appManifest.manifest.id ||
 					typeof rangeTreeItem.rangeOwner !== 'string'
 				) {
@@ -388,6 +392,32 @@ function startFeatures(featureDisposables) {
 		'object-manager.syncObjectReservationBusy',
 		() => undefined
 	);
+	const suggestAvailableObjectId = vscode.commands.registerCommand(
+		'object-manager.suggestAvailableObjectId',
+		async () => {
+			const editor = vscode.window.activeTextEditor;
+			if (!editor || editor.document.languageId !== 'al') {
+				return;
+			}
+			const position = editor.selection.active;
+			const slot = getObjectIdSlot(editor.document.lineAt(position.line).text, position.character);
+			if (!slot) {
+				await vscode.commands.executeCommand('editor.action.triggerSuggest');
+				return;
+			}
+			const objectId = extensionUsageProvider.getNextAvailableObjectId(slot.objectType);
+			if (!objectId) {
+				vscode.window.showInformationMessage(`No available ${slot.objectType} ID remains in app.json idRanges.`);
+				return;
+			}
+			await editor.edit((editBuilder) => editBuilder.replace(
+				new vscode.Range(position.line, slot.start, position.line, slot.end),
+				objectId
+			));
+			const cursor = new vscode.Position(position.line, slot.start + objectId.length);
+			editor.selection = new vscode.Selection(cursor, cursor);
+		}
+	);
 	const installGitValidationHooks = vscode.commands.registerCommand(
 		'object-manager.installGitValidationHooks',
 		async () => {
@@ -433,6 +463,7 @@ function startFeatures(featureDisposables) {
 		forceApplicationRangeToRepositoryBusy,
 		syncObjectReservation,
 		syncObjectReservationBusy,
+		suggestAvailableObjectId,
 		installGitValidationHooks,
 		removeGitValidationHooks,
 		validationServerDisposable,
@@ -712,14 +743,12 @@ async function collectExtensionObjects(failOnReadError = false) {
 	const files = (await vscode.workspace.findFiles(EXTENSION_CONFIG.workspace.alSourcePattern)).sort((left, right) =>
 		left.toString().localeCompare(right.toString())
 	);
-	/** @type {Map<string, ExtensionObject>} */
-	const objectsById = new Map();
+	/** @type {ExtensionObject[]} */
+	const objects = [];
 	for (const file of files) {
 		try {
 			const content = await vscode.workspace.fs.readFile(file);
-			for (const object of parseAlObjects(Buffer.from(content).toString('utf8'))) {
-				objectsById.set(`${object['object type']}:${object['object id']}`, object);
-			}
+			objects.push(...parseAlObjects(Buffer.from(content).toString('utf8')));
 		} catch (error) {
 			if (failOnReadError) {
 				throw new Error(`Unable to read AL source file ${file.toString()}: ${error instanceof Error ? error.message : String(error)}`);
@@ -727,7 +756,7 @@ async function collectExtensionObjects(failOnReadError = false) {
 			console.warn(`Unable to read AL source file ${file.toString()}:`, error);
 		}
 	}
-	return [...objectsById.values()].sort((left, right) =>
+	return objects.sort((left, right) =>
 		left['object type'].localeCompare(right['object type']) ||
 		Number(left['object id']) - Number(right['object id'])
 	);
@@ -743,7 +772,11 @@ async function collectExtensionObjects(failOnReadError = false) {
 async function getApplicationObjectStatuses(repositoryUrl, objects, ranges, headers) {
 	/** @type {Map<string, Promise<unknown[]>>} */
 	const folderContentsByType = new Map();
+	const duplicateObjectKeys = getDuplicateObjectKeys(objects);
 	return Promise.all(objects.map(async (object) => {
+		if (duplicateObjectKeys.has(`${object['object type']}:${object['object id']}`)) {
+			return { object, status: 'conflict' };
+		}
 		if (!isObjectIdInRanges(object['object id'], ranges)) {
 			return { object, status: 'outOfRange' };
 		}
@@ -1390,6 +1423,9 @@ module.exports = {
 	parseAlObjects,
 	collectExtensionObjects,
 	isObjectIdInRanges,
+	getNextAvailableObjectId,
+	getObjectIdSlot,
+	getDuplicateObjectKeys,
 	classifyObjectSyncStatus,
 	getApplicationObjectStatuses,
 	getObjectValidationFailures,
